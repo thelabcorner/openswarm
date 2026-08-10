@@ -106,6 +106,11 @@ export interface SwarmStoreTx {
    */
   releaseTask(taskId: string, opts?: { countAsRetry?: boolean }): Promise<boolean>;
 
+  /** Durable intended-owner binding (delegate member.taskId): the scheduler
+   * prefers this member when the task becomes ready, including later-ready
+   * DAG tasks. Pass null to clear. */
+  setTaskReservation(taskId: string, memberName: string | null): Promise<boolean>;
+
   /** Claimed/working tasks whose claim lease has expired (lease_expires_at <
    * now) — candidates for the sweep to release, subject to the human-chat
    * guard (a chatting owner keeps its lease). */

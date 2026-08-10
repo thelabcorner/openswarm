@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS swarm_task (
   retry_count INTEGER NOT NULL DEFAULT 0,
   claimed_at INTEGER,
   lease_expires_at INTEGER,
+  reserved_for TEXT,
+  reserved_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   completed_at INTEGER,

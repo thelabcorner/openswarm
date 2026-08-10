@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS swarm_task (
   retry_count INTEGER NOT NULL DEFAULT 0,
   claimed_at INTEGER,
   lease_expires_at INTEGER,
+  reserved_for TEXT,
+  reserved_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   completed_at INTEGER,
@@ -298,6 +300,7 @@ interface RowTask {
   status: string; priority: number; owner_member_id: string | null;
   created_by_member_id: string; acceptance_json: string | null; metadata_json: string | null;
   retry_count: number; claimed_at: number | null; lease_expires_at: number | null;
+  reserved_for: string | null; reserved_at: number | null;
   created_at: number; updated_at: number; completed_at: number | null;
 }
 
@@ -376,6 +379,8 @@ function toTask(r: RowTask): SwarmTask {
     retryCount: r.retry_count,
     claimedAt: r.claimed_at ?? undefined,
     leaseExpiresAt: r.lease_expires_at ?? undefined,
+    reservedFor: r.reserved_for ?? undefined,
+    reservedAt: r.reserved_at ?? undefined,
     createdAt: r.created_at, updatedAt: r.updated_at,
     completedAt: r.completed_at ?? undefined,
   };
@@ -621,6 +626,14 @@ export class SQLiteStore implements SwarmStore {
       label: "add swarm_message.noreply (fire-and-forget flag)",
       up: (db) => addColumn(db, "swarm_message", "noreply", "INTEGER NOT NULL DEFAULT 0"),
     },
+    {
+      version: 9,
+      label: "add swarm_task.reserved_for + reserved_at (durable intended-owner binding)",
+      up: (db) => {
+        addColumn(db, "swarm_task", "reserved_for", "TEXT");
+        addColumn(db, "swarm_task", "reserved_at", "INTEGER");
+      },
+    },
   ];
 
   private runMigrations(): void {
@@ -726,6 +739,7 @@ export class SQLiteStore implements SwarmStore {
   claimTask(taskId: string, memberId: string, leaseMs?: number): Promise<boolean> { return this.serialized(() => this.tx.claimTask(taskId, memberId, leaseMs)); }
   updateTaskStatus(taskId: string, status: SwarmTask["status"]): Promise<boolean> { return this.serialized(() => this.tx.updateTaskStatus(taskId, status)); }
   releaseTask(taskId: string, opts?: { countAsRetry?: boolean }): Promise<boolean> { return this.serialized(() => this.tx.releaseTask(taskId, opts)); }
+  setTaskReservation(taskId: string, memberName: string | null): Promise<boolean> { return this.serialized(() => this.tx.setTaskReservation(taskId, memberName)); }
   reassignTask(taskId: string, newOwnerMemberId: string): Promise<string | null> { return this.serialized(() => this.tx.reassignTask(taskId, newOwnerMemberId)); }
   listExpiredLeaseTasks(swarmId: string, now: number): Promise<SwarmTask[]> { return this.serialized(() => this.tx.listExpiredLeaseTasks(swarmId, now)); }
   getBlackboard(swarmId: string, key: string): Promise<BlackboardEntry | undefined> { return this.serialized(() => this.tx.getBlackboard(swarmId, key)); }
@@ -827,11 +841,27 @@ class Tx implements SwarmStoreTx {
           ? t.metadata.retryCount
           : 0;
     this.db.run(
-      `INSERT INTO swarm_task (id, swarm_id, title, description, status, priority, owner_member_id, created_by_member_id, acceptance_json, metadata_json, retry_count, claimed_at, lease_expires_at, created_at, updated_at, completed_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [t.id, t.swarmId, t.title, t.description ?? null, t.status, t.priority, t.ownerMemberId ?? null, t.createdByMemberId, t.acceptanceCriteria ? JSON.stringify(t.acceptanceCriteria) : null, t.metadata ? JSON.stringify(t.metadata) : null, retryCount, t.claimedAt ?? null, t.leaseExpiresAt ?? null, t.createdAt, t.updatedAt, t.completedAt ?? null],
+      `INSERT INTO swarm_task (id, swarm_id, title, description, status, priority, owner_member_id, created_by_member_id, acceptance_json, metadata_json, retry_count, claimed_at, lease_expires_at, reserved_for, reserved_at, created_at, updated_at, completed_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [t.id, t.swarmId, t.title, t.description ?? null, t.status, t.priority, t.ownerMemberId ?? null, t.createdByMemberId, t.acceptanceCriteria ? JSON.stringify(t.acceptanceCriteria) : null, t.metadata ? JSON.stringify(t.metadata) : null, retryCount, t.claimedAt ?? null, t.leaseExpiresAt ?? null, t.reservedFor ?? null, t.reservedAt ?? null, t.createdAt, t.updatedAt, t.completedAt ?? null],
     );
     return t as SwarmTask;
+  }
+
+  /**
+   * Durable intended-owner binding (delegate member.taskId). The scheduler
+   * prefers `reservedFor` when the task becomes ready — including tasks that
+   * become ready LATER via DAG dependency resolution (the per-pass in-memory
+   * reservation died at delegate time; this persists it). Cleared on claim/
+   * release; updated on reassign.
+   */
+  async setTaskReservation(taskId: string, memberName: string | null): Promise<boolean> {
+    const now = Date.now();
+    const res = this.db.run(
+      `UPDATE swarm_task SET reserved_for = ?, reserved_at = ? WHERE id = ?`,
+      [memberName, memberName ? now : null, taskId],
+    );
+    return res.changes > 0;
   }
 
   async insertMessages(msgs: NewMessage[]): Promise<SwarmMessage[]> {
@@ -1469,7 +1499,7 @@ class Tx implements SwarmStoreTx {
     const leaseExpiresAt = (leaseMs !== undefined && leaseMs !== null && leaseMs > 0) ? now + leaseMs : null;
     const res = this.db.run(
       `UPDATE swarm_task
-       SET owner_member_id = ?, status = 'claimed', claimed_at = ?, lease_expires_at = ?, updated_at = ?
+       SET owner_member_id = ?, status = 'claimed', claimed_at = ?, lease_expires_at = ?, reserved_for = NULL, reserved_at = NULL, updated_at = ?
        WHERE id = ? AND owner_member_id IS NULL AND status = 'ready'`,
       [memberId, now, leaseExpiresAt, now, taskId],
     );
@@ -1498,7 +1528,7 @@ class Tx implements SwarmStoreTx {
       `UPDATE swarm_task
        SET owner_member_id = NULL, status = 'ready',
            retry_count = retry_count + ${countAsRetry ? 1 : 0},
-           claimed_at = NULL, lease_expires_at = NULL, updated_at = ?
+           claimed_at = NULL, lease_expires_at = NULL, reserved_for = NULL, reserved_at = NULL, updated_at = ?
        WHERE id = ? AND status IN ('claimed','working','review_pending','changes_requested')`,
       [Date.now(), taskId],
     );
@@ -1545,8 +1575,8 @@ class Tx implements SwarmStoreTx {
     }
     const now = Date.now();
     this.db.run(
-      `UPDATE swarm_task SET owner_member_id = ?, status = 'working', updated_at = ? WHERE id = ?`,
-      [newOwnerMemberId, now, taskId],
+      `UPDATE swarm_task SET owner_member_id = ?, status = 'working', reserved_for = ?, reserved_at = ?, updated_at = ? WHERE id = ?`,
+      [newOwnerMemberId, newOwner.name, now, now, taskId],
     );
     this.db.run(
       `UPDATE swarm_member SET current_task_id = ?, status = 'working', updated_at = ? WHERE id = ?`,

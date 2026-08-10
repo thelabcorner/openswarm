@@ -1044,6 +1044,17 @@ export class SwarmPluginRuntime {
         );
       }
     }
+    // Durable intended-owner fallbacks (S-15): a task whose reservation TTL
+    // expired was freed to affinity — surface WHY so the coordinator sees the
+    // intent was not silently dropped. Low-noise: one line per fallback.
+    if (result && result.reservationFallbacks.length > 0) {
+      for (const f of result.reservationFallbacks) {
+        this.notifyCoordinator(
+          { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
+          `[RESERVATION] task ${f.taskId} freed to affinity assignment: ${f.reason}`,
+        );
+      }
+    }
   }
 
   /**
@@ -1550,6 +1561,24 @@ export async function swarmPlugin(
               .map((m) => m.taskId)
               .filter((t): t is string => !!t),
           );
+          // Durable intended-owner binding (S-15 fix): persist reservedFor on
+          // the task row so the scheduler prefers the named member when the
+          // task becomes ready — INCLUDING tasks that become ready LATER via
+          // DAG dependency resolution (the per-pass in-memory reservation died
+          // at delegate time, which mis-assigned later-ready tasks to idle
+          // affinity winners). Cleared on claim/release; TTL-bounded so a
+          // never-eligible owner cannot starve the task.
+          const tasksNow = await core.store.listTasks(swarmId!);
+          const taskById = new Map(tasksNow.map((t) => [t.id, t]));
+          for (const m of args.members) {
+            if (!m.taskId) continue;
+            const bound = taskById.get(m.taskId);
+            if (bound && bound.ownerMemberId === undefined) {
+              await core.store.setTaskReservation(m.taskId, m.name).catch((err) => {
+                console.warn(`[swarm] delegate reservation: could not bind task ${m.taskId} to ${m.name}: ${(err as Error).message}`);
+              });
+            }
+          }
           await rt.runScheduler(swarmId!, { skipAssignmentFor: reservedTaskIds });
 
           // Spawn members (each may carry its own prompt; otherwise the

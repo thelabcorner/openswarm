@@ -10,6 +10,12 @@ const DEFAULT_CHAT_LULL_MS = 300_000;
 /** Default task claim lease when policies.taskLeaseMs is unset (30 min). */
 export const DEFAULT_TASK_LEASE_MS = 30 * 60_000;
 
+/** Default intended-owner reservation TTL when policies.reservationTtlMs is
+ * unset (10 min): a ready task held for its reserved member is freed to
+ * affinity assignment after this window if the intended owner never becomes
+ * eligible (busy/stopped/never-spawned). Prevents the S-15 permanent stall. */
+export const DEFAULT_RESERVATION_TTL_MS = 10 * 60_000;
+
 /**
  * Whether a member is currently in a human chat (within the lull window).
  * Mirrors the HumanChatTracker derivation so the scheduler can exclude
@@ -43,6 +49,11 @@ export interface SchedulerResult {
    * hard skip); the swarm/coordinator get a `finding` notice with re-plan
    * guidance via runScheduler. */
   hesitationWarnings: Array<{ taskId: string; taskTitle: string; path: string; corpseCount: number; warning: string }>;
+  /** Durable reservation fallbacks: ready tasks whose intended-owner binding
+   * (reservedFor) expired its TTL (intended member busy/stopped/never-spawned)
+   * and were freed to affinity assignment. Surfaces honest "intent was X"
+   * telemetry to the coordinator (S-15 class fix). */
+  reservationFallbacks: Array<{ taskId: string; intendedMemberName: string; reason: string }>;
 }
 
 /** Minimum active `corpse` annotations on one path/area before the scheduler
@@ -169,7 +180,7 @@ export class Scheduler {
       annotations?: Array<Pick<ArtifactAnnotation, "path" | "type" | "authorMemberId">>;
     },
   ): Promise<SchedulerResult> {
-    const result: SchedulerResult = { assigned: [], readyUnassigned: [], activatedMembers: [], failedExceededRetries: [], claimWarnings: [], hesitationWarnings: [] };
+    const result: SchedulerResult = { assigned: [], readyUnassigned: [], activatedMembers: [], failedExceededRetries: [], claimWarnings: [], hesitationWarnings: [], reservationFallbacks: [] };
     // Tasks failed this pass for exceeding maxRetriesPerTask (reported via the
     // coordinator notice in runScheduler's caller; kept in result for tests).
     const failedExceededRetries: string[] = [];
@@ -230,18 +241,51 @@ export class Scheduler {
     }
 
     // 3. Assign ready tasks to idle members, honoring concurrency limits.
+    // Durable intended-owner binding (delegate member.taskId): a task with
+    // reservedFor set is PREFERRED for that member when it becomes ready —
+    // including tasks that become ready LATER via DAG dependency resolution
+    // (the old per-pass in-memory reservation died at delegate time; the
+    // durable column fixes the S-15 class). The transient `skipAssignmentFor`
+    // set still shields tasks before the delegate's spawn pass completes.
     const reserved = opts?.skipAssignmentFor;
-    const ready = tasks
-      .filter((t) => t.status === "ready" && !t.ownerMemberId && !(reserved?.has(t.id) ?? false))
-      .sort((a, b) => b.priority - a.priority);
+    const reservationTtlMs = swarm.policies?.reservationTtlMs ?? DEFAULT_RESERVATION_TTL_MS;
+    const now = Date.now();
+
+    // Split: reserved-ready (durable binding, within TTL) vs free-ready.
+    const reservedReady: SwarmTask[] = [];
+    const ready: SwarmTask[] = [];
+    for (const t of tasks) {
+      if (t.status !== "ready" || t.ownerMemberId) continue;
+      if (reserved?.has(t.id)) continue; // transient shield (spawn-in-flight)
+      if (t.reservedFor && t.reservedAt !== undefined) {
+        if (now - t.reservedAt > reservationTtlMs) {
+          // Reservation expired: the intended owner is busy/stopped/never
+          // spawned — free the task to affinity and record the fallback.
+          await this.store.setTaskReservation(t.id, null);
+          result.reservationFallbacks.push({
+            taskId: t.id,
+            intendedMemberName: t.reservedFor,
+            reason: `reservation TTL expired (${reservationTtlMs}ms) — intended owner '${t.reservedFor}' was not eligible; freed to affinity assignment`,
+          });
+          ready.push(t);
+        } else {
+          reservedReady.push(t);
+        }
+      } else {
+        ready.push(t);
+      }
+    }
+    ready.sort((a, b) => b.priority - a.priority);
+    reservedReady.sort((a, b) => b.priority - a.priority);
 
     // Advisory claim-aware warnings (WIP Aura, H0): for each ready task, check
     // ACTIVE PathClaims held by OTHER members. Overlap = the claim pattern
     // appears in (or shares tokens with) the task text. Warnings only — the
     // task is still assigned (PathClaims are advisory per the accepted
     // contract); the warning lets owners escalate.
+    const warnable = [...ready, ...reservedReady];
     if (opts?.activeClaims?.length) {
-      for (const t of ready) {
+      for (const t of warnable) {
         // S-07: dedupe warnings per (task, holder) — a task overlapping
         // MULTIPLE claims of the same holder emits ONE warning (first matching
         // pattern), not N warnings for N patterns.
@@ -269,7 +313,7 @@ export class Scheduler {
     // `finding` with re-plan guidance.
     if (opts?.annotations?.length) {
       const corpseByPath = corpseCountByPath(opts.annotations);
-      for (const t of ready) {
+      for (const t of warnable) {
         for (const [path, count] of corpseByPath) {
           if (count < CORPSE_PILE_THRESHOLD) continue;
           if (!taskMentionsPath(path, t)) continue;
@@ -306,6 +350,34 @@ export class Scheduler {
       (m) => m.role !== "coordinator" && m.status === "working" && !!m.currentTaskId,
     ).length;
     const capacity = Math.max(0, swarm.policies.maxConcurrentMembers - active);
+
+    const memberByName = new Map(members.map((m) => [m.name, m]));
+    const idleById = new Map(idle.map((m) => [m.id, m]));
+    // Durable intended-owner preference: reserved tasks are offered ONLY to
+    // their intended member (if eligible). An ineligible intended owner HOLDs
+    // the task within the reservation TTL — it must NOT leak to a different
+    // member while the intent is still live (the misassignment bug this fixes).
+    for (const task of reservedReady) {
+      if (result.assigned.length >= capacity) {
+        result.readyUnassigned.push(task.id);
+        continue;
+      }
+      const intended = task.reservedFor ? memberByName.get(task.reservedFor) : undefined;
+      if (intended && idleById.has(intended.id)) {
+        const assigned = await this.assignTask(swarm, task, intended);
+        if (assigned) {
+          result.assigned.push({ taskId: task.id, memberName: intended.name, sessionId: intended.sessionId });
+          result.activatedMembers.push(intended.name);
+        } else {
+          result.readyUnassigned.push(task.id);
+        }
+      } else {
+        // Intended member not idle (busy/chatting/stopped/not found): HOLD —
+        // the reservation TTL sweep will free it if the owner never becomes
+        // eligible. Not assigned to anyone else.
+        result.readyUnassigned.push(task.id);
+      }
+    }
 
     for (const task of ready) {
       const candidates = ordered.get(task.id) ?? [];

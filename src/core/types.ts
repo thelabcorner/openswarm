@@ -64,6 +64,10 @@ export interface SwarmPolicies {
   abortChildrenOnSwarmStop: boolean;
   idleTimeoutMs?: number;
   taskLeaseMs?: number;
+  /** How long a task reservation (delegate member.taskId) is held before the
+   * scheduler falls back to affinity assignment. Prevents a reserved task from
+   * starving when the intended owner is busy/stopped/never-spawned. */
+  reservationTtlMs?: number;
   maxRetriesPerTask: number;
   /** How many failed delivery attempts a message may have before it is marked
    * `failed` and the sender is notified. Defaults to 3. (audit/messaging F-M5:
@@ -90,6 +94,7 @@ export const DEFAULT_POLICIES: SwarmPolicies = {
   maxRetriesPerTask: 2,
   retention: "project",
   humanChatLullMs: 300_000,
+  reservationTtlMs: 600_000,
 };
 
 /** Default delivery-attempt budget for messages (audit/messaging F-M5). */
@@ -165,6 +170,15 @@ export interface SwarmTask {
    * policies.taskLeaseMs; null/undefined = no lease). The sweep releases
    * claimed/working tasks past this timestamp. */
   leaseExpiresAt?: number;
+  /** Member NAME the coordinator explicitly bound this task to at delegation
+   * (member.taskId). The scheduler prefers this member when the task becomes
+   * ready (later-ready DAG tasks included) — explicit intent beats affinity.
+   * Cleared on claim/release; updated on reassign. */
+  reservedFor?: string;
+  /** Epoch-ms when the reservation was written; the scheduler releases a
+   * reservation after policies.reservationTtlMs so a never-eligible intended
+   * owner cannot starve the task (S-15 class). */
+  reservedAt?: number;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
