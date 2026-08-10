@@ -1,0 +1,14 @@
+node_modules
+dist
+*.log
+.opencode/swarms/
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+.opencode/.gitignore
+probe-report*.json
+eshttp/
+agent-skills/
+# Internal planning doc — contains local-machine paths; NOT for public release.
+docs/ROOT_MEMBER_SESSIONS_PLAN.md

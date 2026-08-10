@@ -1,0 +1,36 @@
+{
+  "name": "opencode-agent-swarms",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Plugin-only multi-agent collaboration for OpenCode: durable swarms of native OpenCode sessions.",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./probe": {
+      "import": "./dist/probe/index.js",
+      "types": "./dist/probe/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir=dist --target=bun",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "probe": "bun run src/probe/index.ts",
+    "e2e": "bun run scripts/e2e-plugin.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.15",
+    "@opencode-ai/sdk": "1.18.15"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "5.8.2"
+  }
+}
