@@ -244,12 +244,13 @@ describe("edge cases — messaging", () => {
   test("replyToMessage rejects messages from another swarm", async () => {
     const a = await makeSwarm();
     const b = await makeSwarm();
-    const am = await core.spawnMember({ swarmId: a.swarm.id, name: "alice", role: "r" });
+    const alice = await core.spawnMember({ swarmId: a.swarm.id, name: "alice", role: "r" });
     const bm = await core.spawnMember({ swarmId: b.swarm.id, name: "bob", role: "r" });
-    const req = await core.sendMessage({ swarmId: a.swarm.id, fromMemberId: am.id, to: "alice", kind: "request", message: "q" });
+    const req = await core.sendMessage({ swarmId: a.swarm.id, fromMemberId: a.coordinator.id, to: "alice", kind: "request", message: "q" });
     await expect(
       core.replyToMessage({ swarmId: b.swarm.id, fromMemberId: bm.id, toMessageId: req[0]!.id, message: "reply" }),
     ).rejects.toThrow("different swarm");
+    void alice;
   });
 
   test("replyToMessage rejects when original sender is stopped", async () => {

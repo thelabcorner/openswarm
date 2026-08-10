@@ -585,6 +585,10 @@ export class SwarmCore {
 
     assertNoreplyAllowed(input.kind, input.noreply);
 
+    if (!input.message.trim()) {
+      throw new Error("message body cannot be empty");
+    }
+
     let sender: SwarmMember | undefined;
     if (input.fromMemberId) {
       sender = await this.getMember(input.swarmId, input.fromMemberId);
@@ -612,6 +616,9 @@ export class SwarmCore {
         if (!recipient) throw new Error(`no member named '${input.to}'`);
         if (["stopped", "stopping", "failed"].includes(recipient.status)) {
           throw new Error(`cannot message '${input.to}': member is ${recipient.status}`);
+        }
+        if (recipient.id === sender.id && sender.role !== "coordinator") {
+          throw new Error(`cannot send a message to yourself ('${input.to}' resolves to your own session)`);
         }
         targets = [recipient.id];
       }
@@ -958,6 +965,10 @@ export class SwarmCore {
     const swarm = await this.store.getSwarm(input.swarmId);
     if (!swarm) throw new Error(`no such swarm '${input.swarmId}'`);
 
+    if (!input.message.trim()) {
+      throw new Error("reply body cannot be empty");
+    }
+
     // Locate the original message and verify it belongs to this swarm.
     const original = await this.store.getMessageById(input.toMessageId);
     if (!original) throw new Error(`no message with id '${input.toMessageId}'`);
@@ -985,6 +996,11 @@ export class SwarmCore {
         : undefined;
     if (!sender || sender.swarmId !== swarm.id) {
       throw new Error(`sender is not a member of swarm '${swarm.name}'`);
+    }
+    // A reply to your own message is pointless — it loops back to your own
+    // inbox and burns a turn + cooldown. Hard block for every role.
+    if (original.fromMemberId === sender.id) {
+      throw new Error("cannot reply to your own message — send a fresh message or publish to the blackboard instead");
     }
 
     // The reply goes back to whoever sent the original message. The recipient
