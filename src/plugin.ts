@@ -4,7 +4,7 @@ import { mkdirSync } from "node:fs";
 import type { SwarmStore } from "./storage/store.js";
 import { SQLiteStore } from "./storage/sqlite-store.js";
 import { OpenCodeRuntime } from "./runtime/opencode-runtime.js";
-import { SwarmCore, BlackboardConflict, swarmTaskLeaseMs } from "./core/swarm.js";
+import { SwarmCore, BlackboardConflict, swarmTaskLeaseMs, detectAckReply } from "./core/swarm.js";
 import { Supervisor } from "./supervisor/supervisor.js";
 import { Recovery } from "./supervisor/recovery.js";
 import { Broker } from "./messaging/broker.js";
@@ -1855,7 +1855,13 @@ export async function swarmPlugin(
       }),
 
       swarm_message: tool({
-        description: "Send a direct or broadcast message to a swarm member.",
+        description: [
+          "Send a direct or broadcast message to a swarm member.",
+          "Optionally mark the message noreply (fire-and-forget): the recipient is told",
+          "no response is expected — use for status broadcasts and notices so peers",
+          "don't burn turns on ack-only replies. Kinds that demand a response",
+          "(request/blocker/handoff/review) can never be noreply.",
+        ].join("\n"),
         args: {
           swarmId: tool.schema.string().describe("Swarm id."),
           to: tool.schema.string().describe("Recipient member name, or '*' to broadcast."),
@@ -1866,6 +1872,7 @@ export async function swarmPlugin(
           responseTo: tool.schema.string().optional(),
           priority: tool.schema.enum(["low", "normal", "high", "urgent"]).optional(),
           refs: tool.schema.array(tool.schema.string()).optional(),
+          noreply: tool.schema.boolean().optional().describe("Mark fire-and-forget: recipient is not expected to reply."),
         },
         async execute(args, ctx) {
           const rt = await ensureRt();
@@ -1882,6 +1889,7 @@ export async function swarmPlugin(
             responseTo: args.responseTo,
             priority: args.priority ?? "normal",
             refs: args.refs,
+            noreply: args.noreply,
           });
           // sendMessage now returns PERSISTED post-wake states (audit/messaging
           // F-M1): delivered = injected now, scheduled = claimed mid-flight,
@@ -1910,6 +1918,8 @@ export async function swarmPlugin(
           "Reply to a specific swarm message from a peer.",
           "Keeps the correlation id and points responseTo at the original message, so",
           "request/response threads are preserved without routing through the coordinator.",
+          "Warns (softly) when replying to a noreply message or when the reply looks",
+          "like an ack-only response — send only if you can act or add information.",
         ].join("\n"),
         args: {
           swarmId: tool.schema.string().describe("Swarm id."),
@@ -1918,11 +1928,23 @@ export async function swarmPlugin(
           kind: tool.schema.enum(["response", "finding", "handoff", "blocker", "decision", "review", "request", "message", "control"]).optional(),
           priority: tool.schema.enum(["low", "normal", "high", "urgent"]).optional(),
           refs: tool.schema.array(tool.schema.string()).optional(),
+          noreply: tool.schema.boolean().optional().describe("Mark this reply fire-and-forget (informational follow-up)."),
         },
         async execute(args, ctx) {
           const rt = await ensureRt();
           const core = rt.core;
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          const original = await core.store.getMessageById(args.toMessageId);
+          const warnings: string[] = [];
+          // Soft guard 1: replying to a noreply message (never a hard block).
+          if (original?.noreply) {
+            warnings.push("the original message is marked noreply — reply only if you can act or escalate");
+          }
+          // Soft guard 2: ack-detection nudge on echo-like/trivial replies.
+          const ackNote = original
+            ? detectAckReply(original.body.text, args.message)
+            : undefined;
+          if (ackNote) warnings.push(ackNote);
           const msgs = await core.replyToMessage({
             swarmId: args.swarmId,
             fromSessionId: ctx.sessionID,
@@ -1931,10 +1953,12 @@ export async function swarmPlugin(
             kind: args.kind ?? "response",
             priority: args.priority,
             refs: args.refs,
+            noreply: args.noreply,
           });
           return {
             output: JSON.stringify({
               delivered: msgs.map((m) => ({ id: m.id, to: m.to, kind: m.kind, state: m.deliveryState })),
+              ...(warnings.length ? { warnings } : {}),
             }, null, 2),
           };
         },

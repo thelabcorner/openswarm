@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS swarm_message (
   delivery_state TEXT NOT NULL,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
+  noreply INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   delivered_at INTEGER,
   acknowledged_at INTEGER,

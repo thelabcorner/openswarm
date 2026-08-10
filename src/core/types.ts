@@ -192,6 +192,11 @@ export interface SwarmMessage {
   };
   deliveryState: DeliveryState;
   attemptCount: number;
+  /** Sender-set "fire-and-forget" marker: the recipient is NOT expected to
+   * reply (status/notice broadcasts). Never allowed on kinds that demand
+   * action (`request`, `blocker`, `handoff`, `review`). Structural guard
+   * against ack-only responses (anti-pattern A2). */
+  noreply?: boolean;
   /** Last delivery-failure reason (written by the broker on revert; surfaced
    * to the sender when the retry budget is exhausted, F-M5). */
   lastError?: string;

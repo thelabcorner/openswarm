@@ -35,6 +35,44 @@ export function makeId(prefix: string, rand: () => string = () => crypto.randomU
   return `${prefix}_${rand().replace(/[-]/g, "")}`;
 }
 
+/**
+ * Noreply validation (noreply feature): kinds that DEMAND a response from the
+ * recipient can never be marked fire-and-forget — a silent blocker/request
+ * would be a coordination dead-end, and a handoff/review requires the receiver
+ * to act. Throws with a clear, actionable message.
+ */
+export function assertNoreplyAllowed(kind: SwarmMessage["kind"], noreply?: boolean): void {
+  if (!noreply) return;
+  if (kind === "request" || kind === "blocker" || kind === "handoff" || kind === "review") {
+    throw new Error(
+      `kind '${kind}' cannot be marked noreply — it demands a response from the recipient. ` +
+        `Remove the noreply flag or use a kind that is informational (message/finding/decision/response/control).`,
+    );
+  }
+}
+
+/**
+ * Ack-detection nudge (anti-pattern A2): a reply that is echo-like (contains
+ * the original text) or trivially short is likely an ack-only response that
+ * costs a mailbox turn + cooldown with zero signal. Returns a warning string
+ * for the caller to surface to the sender — WARN ONLY, never a block
+ * (legitimate terse replies exist).
+ */
+export function detectAckReply(originalText: string, replyText: string): string | undefined {
+  const orig = originalText.trim().toLowerCase();
+  const reply = replyText.trim().toLowerCase();
+  if (!orig || !reply) return undefined;
+  // Trivially short ack ("ok", "noted", "thanks", "👍").
+  if (reply.length <= 12) {
+    return `reply looks like an ack-only response (${reply.length} chars) — ack-only messages are anti-pattern A2: they cost a mailbox turn and cooldown with no signal. Only send if you can act or add information.`;
+  }
+  // Echo-like: the reply is contained in the original or vice versa.
+  if (orig.includes(reply) || reply.includes(orig)) {
+    return "reply appears to echo the original message — ack-only responses are anti-pattern A2. Only send if you can act or add information.";
+  }
+  return undefined;
+}
+
 export interface CreateSwarmInput {
   name: string;
   projectId: string;
@@ -536,10 +574,16 @@ export class SwarmCore {
     responseTo?: string;
     priority?: SwarmMessage["priority"];
     refs?: string[];
+    /** Sender-set fire-and-forget flag (noreply feature): the recipient is
+     * NOT expected to reply. Rejected for kinds that demand action
+     * (`request`, `blocker`, `handoff`, `review`) — those must stay replyable. */
+    noreply?: boolean;
   }): Promise<SwarmMessage[]> {
     const swarm = await this.store.getSwarm(input.swarmId);
     if (!swarm) throw new Error(`no such swarm '${input.swarmId}'`);
     const now = Date.now();
+
+    assertNoreplyAllowed(input.kind, input.noreply);
 
     let sender: SwarmMember | undefined;
     if (input.fromMemberId) {
@@ -588,6 +632,7 @@ export class SwarmCore {
           body: { text: input.message, refs: input.refs },
           deliveryState: "queued",
           attemptCount: 0,
+          noreply: input.noreply,
           createdAt: now,
           expiresAt,
         };
@@ -780,6 +825,8 @@ export class SwarmCore {
       message: body,
       correlationId: `consolidation:${key}`,
       refs: [`hive://consolidation/${key}`],
+      // System status broadcast: fire-and-forget — recipients must NOT ack.
+      noreply: true,
     });
     notices.push(...coordMsgs);
     // Compact one-line swarm broadcast (never a full re-dump of the detail).
@@ -791,6 +838,8 @@ export class SwarmCore {
       message: summary,
       correlationId: `consolidation:${key}`,
       refs: [`hive://consolidation/${key}`],
+      // System status broadcast: fire-and-forget — recipients must NOT ack.
+      noreply: true,
     });
     notices.push(...broadcast);
     return notices;
@@ -817,6 +866,8 @@ export class SwarmCore {
       kind: "finding",
       message: body,
       refs: ["hive://pruning"],
+      // System status broadcast: fire-and-forget — recipients must NOT ack.
+      noreply: true,
     });
   }
 
@@ -847,6 +898,8 @@ export class SwarmCore {
       kind: "finding",
       message: renderDigestNotice(healthy(health) ? "healthy" : "degraded"),
       refs: ["hive://digest"],
+      // System status broadcast: fire-and-forget — recipients must NOT ack.
+      noreply: true,
     });
     return { health, notified: true };
   }
@@ -899,6 +952,8 @@ export class SwarmCore {
     kind?: SwarmMessage["kind"];
     priority?: SwarmMessage["priority"];
     refs?: string[];
+    /** Reply can itself be marked noreply (fire-and-forget follow-up). */
+    noreply?: boolean;
   }): Promise<SwarmMessage[]> {
     const swarm = await this.store.getSwarm(input.swarmId);
     if (!swarm) throw new Error(`no such swarm '${input.swarmId}'`);
@@ -908,6 +963,19 @@ export class SwarmCore {
     if (!original) throw new Error(`no message with id '${input.toMessageId}'`);
     if (original.swarmId !== swarm.id) {
       throw new Error(`message '${input.toMessageId}' belongs to a different swarm`);
+    }
+    const kind = input.kind ?? "response";
+    assertNoreplyAllowed(kind, input.noreply);
+
+    // Noreply soft guard: replying to a message the sender marked as
+    // fire-and-forget is discouraged — the recipient should only reply if
+    // they can act or escalate. This is a soft warning, never a hard block
+    // (legitimate escalations exist).
+    if (original.noreply) {
+      console.warn(
+        `[swarm] reply to noreply message '${original.id}' from ${original.fromMemberId}: ` +
+          `original was marked fire-and-forget — only reply if you can act or escalate (noreply feature).`,
+      );
     }
 
     const sender = input.fromMemberId
@@ -932,13 +1000,14 @@ export class SwarmCore {
       swarmId: swarm.id,
       fromMemberId: sender.id,
       to: { type: "member", memberId: recipientId },
-      kind: input.kind ?? "response",
+      kind,
       correlationId: original.correlationId,
       responseTo: original.id,
       priority: input.priority ?? original.priority,
       body: { text: input.message, refs: input.refs },
       deliveryState: "queued",
       attemptCount: 0,
+      noreply: input.noreply,
       createdAt: Date.now(),
     };
     const inserted = await this.store.insertMessages([msg]);

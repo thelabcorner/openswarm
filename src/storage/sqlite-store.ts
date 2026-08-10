@@ -156,6 +156,7 @@ CREATE TABLE IF NOT EXISTS swarm_message (
   delivery_state TEXT NOT NULL,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
+  noreply INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   delivered_at INTEGER,
   acknowledged_at INTEGER,
@@ -304,7 +305,7 @@ interface RowMessage {
   id: string; swarm_id: string; from_member_id: string; to_member_id: string | null;
   is_broadcast: number; kind: string; task_id: string | null; correlation_id: string | null;
   response_to: string | null; priority: string; body_text: string; refs_json: string | null;
-  delivery_state: string; attempt_count: number; last_error: string | null;
+  delivery_state: string; attempt_count: number; last_error: string | null; noreply: number;
   created_at: number; delivered_at: number | null; acknowledged_at: number | null;
   expires_at: number | null;
 }
@@ -395,6 +396,7 @@ function toMessage(r: RowMessage): SwarmMessage {
     deliveryState: r.delivery_state as SwarmMessage["deliveryState"],
     attemptCount: r.attempt_count,
     lastError: r.last_error ?? undefined,
+    noreply: r.noreply === 1,
     createdAt: r.created_at,
     deliveredAt: r.delivered_at ?? undefined,
     acknowledgedAt: r.acknowledged_at ?? undefined,
@@ -614,6 +616,11 @@ export class SQLiteStore implements SwarmStore {
       label: "add swarm_belief.resonant_at (Hive H2 resonance)",
       up: (db) => addColumn(db, "swarm_belief", "resonant_at", "INTEGER"),
     },
+    {
+      version: 8,
+      label: "add swarm_message.noreply (fire-and-forget flag)",
+      up: (db) => addColumn(db, "swarm_message", "noreply", "INTEGER NOT NULL DEFAULT 0"),
+    },
   ];
 
   private runMigrations(): void {
@@ -829,8 +836,8 @@ class Tx implements SwarmStoreTx {
 
   async insertMessages(msgs: NewMessage[]): Promise<SwarmMessage[]> {
     const stmt = this.db.prepare(
-      `INSERT INTO swarm_message (id, swarm_id, from_member_id, to_member_id, is_broadcast, kind, task_id, correlation_id, response_to, priority, body_text, refs_json, delivery_state, attempt_count, created_at, delivered_at, acknowledged_at, expires_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO swarm_message (id, swarm_id, from_member_id, to_member_id, is_broadcast, kind, task_id, correlation_id, response_to, priority, body_text, refs_json, delivery_state, attempt_count, last_error, noreply, created_at, delivered_at, acknowledged_at, expires_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     );
     for (const m of msgs) {
       stmt.run(
@@ -840,7 +847,9 @@ class Tx implements SwarmStoreTx {
         m.kind, m.taskId ?? null, m.correlationId ?? null, m.responseTo ?? null,
         m.priority, m.body.text,
         m.body.refs && m.body.refs.length ? JSON.stringify(m.body.refs) : null,
-        m.deliveryState, m.attemptCount, m.createdAt,
+        m.deliveryState, m.attemptCount,
+        m.lastError ?? null, m.noreply ? 1 : 0,
+        m.createdAt,
         m.deliveredAt ?? null, m.acknowledgedAt ?? null, m.expiresAt ?? null,
       );
     }

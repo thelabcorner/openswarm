@@ -82,12 +82,20 @@ export class Broker {
     const self = await this.store.getMemberById(memberId);
     const ctx = await this.memberContext(memberId, names);
     const inbox = toDeliver.map((m) => formatEnvelope(m, names)).join("\n");
+    // Noreply: when EVERY message in the batch is fire-and-forget, the member
+    // is explicitly told no response is expected — saves a mailbox turn and
+    // cooldown that an ack-only reply would have burned (noreply feature).
+    const allNoreply = toDeliver.length > 0 && toDeliver.every((m) => m.noreply);
+    const replyLine = allNoreply
+      ? "None of these messages expect a reply — do not respond unless you can act or escalate."
+      : "Reply to senders with swarm_message (to: <name>) or swarm_reply with the message id where a response is needed.";
     // A normal user turn (not synthetic) prefixed with the necessary swarm
     // context so the receiving agent can act: its identity, the swarm id
     // (required as a tool argument), and the reply protocol.
     const promptText = [
       `[SWARM INBOX — ${toDeliver.length}]`,
       ctx,
+      replyLine,
       inbox,
     ].join("\n");
 

@@ -41,10 +41,11 @@ export function formatEnvelope(
   // (audit/messaging F-M3). Deliberately a distinct `msg:` token — not
   // "Message-ID" — so it stays compact and thread-continuation is actionable.
   const idLine = `\nmsg: ${m.id}`;
+  const noreplyLabel = m.noreply ? "\n[noreply — no response expected; do not ack]" : "";
   const threadHint = m.responseTo
     ? "\n(responds to your earlier message — use swarm_reply to continue the thread)"
     : "";
-  return `${from}${kindLabel}${priorityLabel}: ${body}${refs}${idLine}${threadHint}`;
+  return `${from}${kindLabel}${priorityLabel}: ${body}${refs}${idLine}${noreplyLabel}${threadHint}`;
 }
 
 /** Format a blackboard conflict notice (spec §24). */
