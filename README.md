@@ -100,6 +100,7 @@ Plugin options:
 |---|---|---|
 | `allowAllMemberPermissions` | `false` | Auto-allow every permission requested by swarm members (headless sessions never wedge on prompts). |
 | `defaultMemberModel` | `opencode-go` / `deepseek-v4-flash` | Model used for spawned members when no explicit model is given and no last-used model is known. |
+| `storeBackend` | `chunkdb` | Storage backend. `chunkdb` (default) stores compressed payload chunks over SQLite (~66% smaller files); `sqlite` keeps the classic row store. Switching to `chunkdb` auto-migrates an existing `swarms.db` on first open. |
 
 Then restart OpenCode. Verify the plugin is live and the runtime is compatible:
 

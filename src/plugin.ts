@@ -1959,7 +1959,7 @@ export async function initSwarmRuntime(input: PluginInput, options: SwarmPluginO
   } catch {
     // best effort; the store will surface a clear error if it cannot open
   }
-  const backend = options.storeBackend ?? "sqlite";
+  const backend = options.storeBackend ?? "chunkdb";
   let store: SwarmStore;
   if (options.store) {
     store = options.store;
