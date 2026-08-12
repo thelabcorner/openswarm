@@ -80,6 +80,15 @@ export interface RuntimeModelInfo {
   name?: string;
   /** Provider tier: "zen" (OpenCode Zen), "zen-free", "go" (OpenCode Go), or provider id. */
   tier: string;
+  /** Capabilities (from the provider config `modalities`): which input kinds
+   * the model can consume (text/image/pdf/audio/video). A model with no
+   * modalities declared is assumed text-only (safe for the capability filter). */
+  modalities?: { input: string[]; output: string[] };
+  /** USD per 1M tokens (provider config `cost`). Absent when unknown — the
+   * pricing fallback catalog or tier ordering applies then. */
+  cost?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+  /** Context window in tokens (provider config `limit.context`). */
+  contextLimit?: number;
 }
 
 export interface AgentRuntime {

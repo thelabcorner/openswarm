@@ -151,6 +151,17 @@ Members get a model via a deterministic priority chain — never a random runtim
 
 Every spawn output reports `model` + `modelSource` (`requested | last-used | coordinator | default | fallback | none`) so you always see *why* a member got its model. Use `swarm_models` to confirm availability; you rarely need to set `model` yourself.
 
+### Capability delegation (images / PDFs)
+
+When the operator supplies an image (or the current model cannot read one), delegate to a subagent on a model that actually can — cheapest first:
+
+```
+swarm_models(capability: "image")        # models that can read images, cheapest first, with prices
+swarm_spawn(swarmId, members: [{ name: "vision-reader", role: "image reader", capability: "pdf" }])
+```
+
+`swarm_models(capability: ...)` lists only capable models sorted by cost-per-1M-tokens (provider-published, with a fallback catalog); spawning a member with `capability` picks the **cheapest capable model** automatically (`modelSource: "capability"`). An explicit `model` always wins over capability.
+
 ---
 
 ## Tools reference

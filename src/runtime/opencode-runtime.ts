@@ -240,6 +240,22 @@ export class OpenCodeRuntime implements AgentRuntime {
           modelID,
           name: typeof info?.name === "string" ? info.name : undefined,
           tier,
+          // Capability + cost metadata come straight from the provider config
+          // (modalities/cost/limit) when the provider publishes them — the
+          // capability-aware delegation feature reads these for vision/pdf
+          // tasks and cheap-model selection.
+          modalities: info?.modalities
+            ? { input: info.modalities.input ?? [], output: info.modalities.output ?? [] }
+            : undefined,
+          cost: info?.cost
+            ? {
+                input: Number(info.cost.input) || 0,
+                output: Number(info.cost.output) || 0,
+                ...(info.cost.cache_read !== undefined ? { cacheRead: Number(info.cost.cache_read) || 0 } : {}),
+                ...(info.cost.cache_write !== undefined ? { cacheWrite: Number(info.cost.cache_write) || 0 } : {}),
+              }
+            : undefined,
+          contextLimit: info?.limit?.context !== undefined ? Number(info.limit.context) || undefined : undefined,
         });
       }
     }

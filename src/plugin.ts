@@ -21,6 +21,7 @@ import { formatInbox, formatEnvelope, formatBlackboardConflict } from "./messagi
 import { enrichForeignSenderNames } from "./messaging/senders.js";
 import { extractAllMentionTokens, extractFileMentions, extractMemberMentions, extractTaskMentions } from "./messaging/mentions.js";
 import { ReviveEngine } from "./revive/revive.js";
+import { cheapestWithCapability, hasCapability, modelInputPrice, modelOutputPrice, priceLabel, capabilityLabel, modelsWithCapability, type ModelCapability } from "./models/catalog.js";
 import { EmergencyGuard, emergencyBlockMessage, emergencyAutoTripHeader, CONFIRM_CLEAR, CONFIRM_STOP, CONFIRM_NUKE } from "./emergency/killswitch.js";
 import { fence } from "./core/fence.js";
 import { recordEvent } from "./core/events.js";
@@ -1862,6 +1863,7 @@ export class SwarmPluginRuntime implements StallHost {
   async resolveSpawnModel(
     swarmId: string,
     requested?: { providerID?: string; modelID?: string },
+    capability?: ModelCapability,
   ): Promise<{ model?: { providerID: string; modelID: string }; source: string; note?: string }> {
     // A bad explicit request must be REPORTED (note), never silently ignored —
     // that is the "member got the wrong model" confusion this chain fixes.
@@ -1874,6 +1876,23 @@ export class SwarmPluginRuntime implements StallHost {
       const resolved = await this.resolveModel(requested);
       if (resolved) return { model: resolved, source: "requested" };
       notes.push(`requested model '${requestDesc}' is not available here`);
+    }
+
+    // 1b. CAPABILITY DELEGATION: when a capability is required (image/pdf/
+    // audio/video — e.g. the operator supplied an image and the current model
+    // cannot read it), pick the CHEAPEST configured model that can consume it.
+    // Falls through to the normal chain when no configured model has it.
+    if (capability && capability !== "text") {
+      const all = await this.listModels();
+      const best = cheapestWithCapability(all, capability);
+      if (best) {
+        return {
+          model: { providerID: best.providerID, modelID: best.modelID },
+          source: "capability",
+          note: `cheapest model with '${capability}' capability (${priceLabel(best)})${notes.length ? `; ${notes.join("; ")}` : ""}`,
+        };
+      }
+      notes.push(`no configured model can consume '${capability}' — falling back to the normal chain`);
     }
 
     // 2. Last-used tuple (memory, then blackboard).
@@ -2033,6 +2052,7 @@ export async function swarmPlugin(
             role: tool.schema.string().describe("Role description."),
             agent: tool.schema.string().optional(),
             model: tool.schema.object({ providerID: tool.schema.string(), modelID: tool.schema.string() }).optional().describe("Optional. Omit to use the swarm default model (config defaultMemberModel; default deepseek-v4-flash on opencode-go). Only set when a specific model is required."),
+            capability: tool.schema.enum(["image", "pdf", "audio", "video", "text"]).optional().describe("Optional. Required input capability (e.g. the operator supplied an image): spawns on the CHEAPEST configured model that can consume it (capability delegation). Ignored when model is set."),
             taskId: tool.schema.string().optional().describe("Task id to assign to this member."),
             prompt: tool.schema.string().optional().describe("Full working brief for this member (the scheduler also auto-assigns ready tasks)."),
             workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
@@ -2204,7 +2224,7 @@ export async function swarmPlugin(
               }
               continue;
             }
-            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(swarmId!, m.model as never);
+            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(swarmId!, m.model as never, m.capability as never);
             if (model) await rt.recordUsedModel(swarmId!, model);
             const member = await core.spawnMember({
               swarmId: swarmId!,
@@ -2363,6 +2383,7 @@ export async function swarmPlugin(
             providerID: tool.schema.string(),
             modelID: tool.schema.string(),
           }).optional().describe("Optional. Omit to use the swarm default model (config defaultMemberModel; default deepseek-v4-flash on opencode-go). Only set when a specific model is required."),
+          capability: tool.schema.enum(["image", "pdf", "audio", "video", "text"]).optional().describe("Optional. Required input capability (e.g. the operator supplied an image): spawns on the CHEAPEST configured model that can consume it (capability delegation). Ignored when model is set."),
           workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
         },
         async execute(args, ctx) {
@@ -2406,7 +2427,7 @@ export async function swarmPlugin(
             // rate tripwire.
             const refusal = await rt.emergencySpawnGuard(1);
             if (refusal) return { output: refusal };
-            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(args.swarmId, args.model as never);
+            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(args.swarmId, args.model as never, args.capability as never);
             if (model) await rt.recordUsedModel(args.swarmId, model);
             member = await core.spawnMember({
               swarmId: args.swarmId,
@@ -2478,6 +2499,7 @@ export async function swarmPlugin(
               providerID: tool.schema.string().describe("Real provider id (e.g. opencode, opencode-go, lmstudio) — NOT a tier label."),
               modelID: tool.schema.string(),
             }).optional().describe("Optional. Omit to use the swarm default model (config defaultMemberModel; default deepseek-v4-flash on opencode-go). Only set when a specific model is required."),
+            capability: tool.schema.enum(["image", "pdf", "audio", "video", "text"]).optional().describe("Optional. Required input capability (e.g. the operator supplied an image): spawns on the CHEAPEST configured model that can consume it (capability delegation). Ignored when model is set."),
             taskId: tool.schema.string().optional().describe("Task id to assign (for tracking/claims)."),
             prompt: tool.schema.string().describe("The full working brief for this member."),
             workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
@@ -2494,7 +2516,7 @@ export async function swarmPlugin(
           if (refusal) return { output: refusal };
           const created: Array<Record<string, unknown>> = [];
           for (const m of args.members) {
-            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(args.swarmId, m.model as never);
+            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(args.swarmId, m.model as never, m.capability as never);
             if (model) await rt.recordUsedModel(args.swarmId, model);
             const member = await core.spawnMember({
               swarmId: args.swarmId,
@@ -3829,6 +3851,13 @@ export async function swarmPlugin(
           "defaultMemberModel), then the last-used model, then the coordinator's",
           "own model. Only query this to confirm availability or pick a",
           "SPECIFIC model for a special member.",
+          "CAPABILITY DELEGATION: when the operator supplies an image/PDF (or the",
+          "current model cannot read one), pass capability: 'image'|'pdf'|'audio'|'video'",
+          "— the list then shows ONLY models that can consume it, CHEAPEST FIRST,",
+          "with prices (provider-published cost per 1M tokens). Spawn the subagent",
+          "with the cheapest capable model, e.g. member.model = { providerID, modelID }",
+          "from the top of that list (or pass capability on the member directly and",
+          "the spawn picks the cheapest capable model for you).",
           "Tiers:",
           "  zen-free  - OpenCode Zen free models",
           "  zen       - OpenCode Zen paid models",
@@ -3839,6 +3868,8 @@ export async function swarmPlugin(
         args: {
           tier: tool.schema.enum(["zen-free", "zen", "go", "all"]).optional().describe("Filter by tier (default all)."),
           search: tool.schema.string().optional().describe("Filter model ids by substring (e.g. 'flash', 'longcat')."),
+          capability: tool.schema.enum(["image", "pdf", "audio", "video", "text"]).optional().describe("Only models that can consume this input kind, cheapest first (capability delegation)."),
+          cheapest: tool.schema.number().optional().describe("Cap the listing to the N cheapest matching models (with capability, caps the cheapest-first list)."),
         },
         async execute(args) {
           const rt = await ensureRt();
@@ -3847,16 +3878,36 @@ export async function swarmPlugin(
           const filtered = all.filter((m) => {
             if (args.tier && args.tier !== "all" && m.tier !== args.tier) return false;
             if (args.search && !m.modelID.toLowerCase().includes(args.search.toLowerCase())) return false;
+            if (args.capability && !hasCapability(m, args.capability as ModelCapability)) return false;
             return true;
           });
           const byTier = new Map<string, string[]>();
+          const lines: string[] = [];
+          if (args.capability) {
+            // Capability delegation view: cheapest-first, prices + capabilities.
+            const capable = modelsWithCapability(filtered, args.capability as ModelCapability);
+            const capped = args.cheapest ? capable.slice(0, args.cheapest) : capable;
+            const best = capable[0];
+            lines.push(`MODELS WITH CAPABILITY '${args.capability}' (${capable.length} — cheapest first):`);
+            for (const m of capped) {
+              const marker = m === best ? "  ★ CHEAPEST " : "  ";
+              const label = m.name && m.name !== m.modelID ? `${m.modelID} (${m.name})` : m.modelID;
+              lines.push(
+                `${marker}${label}  -> providerID: "${m.providerID}", modelID: "${m.modelID}"`,
+                `      ${priceLabel(m)} | ctx: ${m.contextLimit ? Math.round(m.contextLimit / 1000) + "k" : "?"} | capabilities: ${capabilityLabel(m)}`,
+              );
+            }
+            if (capable.length === 0) {
+              lines.push("  (none — no configured model can consume this input kind)");
+            }
+            return { output: lines.join("\n") };
+          }
           for (const m of filtered) {
             const list = byTier.get(m.tier) ?? [];
             const label = m.name && m.name !== m.modelID ? `  ${m.modelID} (${m.name})` : `  ${m.modelID}`;
-            list.push(`${label}  -> providerID: "${m.providerID}", modelID: "${m.modelID}"`);
+            list.push(`${label}  -> providerID: "${m.providerID}", modelID: "${m.modelID}"  | ${priceLabel(m)} | capabilities: ${capabilityLabel(m)}`);
             byTier.set(m.tier, list);
           }
-          const lines: string[] = [];
           // Show the resolved default up front so the coordinator never has to
           // wonder what members get when model is omitted (AUIX).
           const def = await rt.resolveModel(rt.defaultMemberModel);
