@@ -1,4 +1,4 @@
-import { brotliCompressSync, brotliDecompressSync, zstdCompressSync, zstdDecompressSync, constants as zc } from "node:zlib";
+import { brotliCompressSync, brotliDecompressSync, zstdCompressSync, zstdDecompressSync, deflateRawSync, inflateRawSync, gzipSync, gunzipSync, constants as zc } from "node:zlib";
 
 export type CodecName = "none" | "deflate-fast" | "deflate-ratio" | "gzip-fast" | "brotli" | "zstd-fast" | "zstd-ratio" | "auto-speed" | "auto-ratio";
 
@@ -18,13 +18,13 @@ export function compress(codec: CodecName, input: Uint8Array): CodecResult {
     // close to libdeflate's speed but materially denser on structured payloads.
     const out = input.byteLength >= 768
       ? u8(zstdCompressSync(buf, { params: { [zc.ZSTD_c_compressionLevel]: 1 } } as any))
-      : u8(Bun.deflateSync(buf, { level: 1, library: "libdeflate", windowBits: -15 } as any));
+      : u8(deflateRawSync(buf, { level: 1 }));
     const name = input.byteLength >= 768 ? "zstd-fast" as const : "deflate-fast" as const;
     return out.byteLength + 8 < input.byteLength * 0.95 ? { codec: name, data: out } : { codec: "none", data: input };
   }
   if (codec === "auto-ratio") {
     if (input.byteLength < 192) return { codec: "none", data: input };
-    const d = u8(Bun.deflateSync(buf, { level: 9, library: "libdeflate", windowBits: -15 } as any));
+    const d = u8(deflateRawSync(buf, { level: 9 }));
     const b = u8(brotliCompressSync(buf, { params: { [zc.BROTLI_PARAM_QUALITY]: 5 } }));
     const z = u8(zstdCompressSync(buf, { params: { [zc.ZSTD_c_compressionLevel]: 5 } } as any));
     const best = z.byteLength < b.byteLength && z.byteLength < d.byteLength
@@ -34,9 +34,9 @@ export function compress(codec: CodecName, input: Uint8Array): CodecResult {
   }
   switch (codec) {
     case "none": return { codec, data: input };
-    case "deflate-fast": return { codec, data: u8(Bun.deflateSync(buf, { level: 1, library: "libdeflate", windowBits: -15 } as any)) };
-    case "deflate-ratio": return { codec, data: u8(Bun.deflateSync(buf, { level: 9, library: "libdeflate", windowBits: -15 } as any)) };
-    case "gzip-fast": return { codec, data: u8(Bun.gzipSync(buf, { level: 1, library: "libdeflate" })) };
+    case "deflate-fast": return { codec, data: u8(deflateRawSync(buf, { level: 1 })) };
+    case "deflate-ratio": return { codec, data: u8(deflateRawSync(buf, { level: 9 })) };
+    case "gzip-fast": return { codec, data: u8(gzipSync(buf, { level: 1 })) };
     case "brotli": return { codec, data: u8(brotliCompressSync(buf, { params: { [zc.BROTLI_PARAM_QUALITY]: 5 } })) };
     case "zstd-fast": return { codec, data: u8(zstdCompressSync(buf, { params: { [zc.ZSTD_c_compressionLevel]: 1 } } as any)) };
     case "zstd-ratio": return { codec, data: u8(zstdCompressSync(buf, { params: { [zc.ZSTD_c_compressionLevel]: 5 } } as any)) };
@@ -48,8 +48,8 @@ export function decompress(codec: string, input: Uint8Array): Uint8Array {
   switch (codec) {
     case "none": return input;
     case "deflate-fast":
-    case "deflate-ratio": return u8(Bun.inflateSync(buf, { windowBits: -15 } as any));
-    case "gzip-fast": return u8(Bun.gunzipSync(buf));
+    case "deflate-ratio": return u8(inflateRawSync(buf));
+    case "gzip-fast": return u8(gunzipSync(buf));
     case "brotli": return u8(brotliDecompressSync(buf));
     case "zstd-fast":
     case "zstd-ratio": return u8(zstdDecompressSync(buf));

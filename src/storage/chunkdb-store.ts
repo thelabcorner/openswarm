@@ -42,7 +42,7 @@ import type { SwarmStore, SwarmStoreTx } from "./store.js";
  * 'blackboard' | 'belief' | 'annotation' | 'claim' | 'subscription' |
  * 'permission' | 'event' | 'deliverable' | 'contract' | 'meta'.
  *
- * Entity key scheme: swarmId + NUL ("\u0000") + entityKey where:
+ * Entity key scheme: swarmId + SEP ("\u001F") + entityKey where: (SEP is NUL-free — node:sqlite, the Desktop host driver, truncates text bindings at NUL, so "\0" separators would collide keys)
  *   swarm        = id            (the swarm id IS the key — no prefix needed)
  *   member       = id
  *   task         = id
@@ -51,7 +51,7 @@ import type { SwarmStore, SwarmStoreTx } from "./store.js";
  *   blackboard   = key
  *   belief       = factHash      (dedupe by (swarmId, factHash) — re-insert
  *                                 REINFORCES, mirroring sqlite)
- *   annotation   = path + NUL + type   (replace semantics, id preserved)
+ *   annotation   = path + SEP + type   (replace semantics, id preserved)
  *   claim        = id
  *   subscription = id
  *   permission   = id
@@ -76,7 +76,7 @@ import type { SwarmStore, SwarmStoreTx } from "./store.js";
  * (which would deadlock).
  */
 
-const NUL = "\u0000";
+const SEP = "\u001F"; // unit separator — NUL-free (node:sqlite truncates text bindings at NUL)
 
 const NS = {
   swarm: "swarm",
@@ -103,7 +103,7 @@ const ENTITY_NAMESPACES: string[] = [
   NS.deliverable, NS.contract,
 ];
 
-const keyOf = (swarmId: string, entityKey: string): string => swarmId + NUL + entityKey;
+const keyOf = (swarmId: string, entityKey: string): string => swarmId + SEP + entityKey;
 const evtSeqKey = (swarmId: string): string => `evtseq:${swarmId}`;
 const pad12 = (n: number): string => String(n).padStart(12, "0");
 
@@ -150,6 +150,7 @@ export class ChunkDbStore implements SwarmStore {
     if (this.closed) throw new Error("store is closed");
     if (this.db) return;
     this.db = new ChunkDB(this.path);
+    await this.db.ready();
   }
 
   private serialized<T>(op: () => Promise<T>): Promise<T> {
@@ -381,7 +382,7 @@ export class ChunkDbStore implements SwarmStore {
       }
       for (const ann of this.scan<ArtifactAnnotation>(NS.annotation, member.swarmId)) {
         if (ann.authorMemberId === memberId) {
-          this.db.delete(NS.annotation, keyOf(member.swarmId, ann.path + NUL + ann.type));
+          this.db.delete(NS.annotation, keyOf(member.swarmId, ann.path + SEP + ann.type));
         }
       }
       for (const b of this.scan<Belief>(NS.belief, member.swarmId)) {
@@ -947,7 +948,7 @@ export class ChunkDbStore implements SwarmStore {
     return this.serialized(async () => {
       const now = a.createdAt;
       const expiresAt = a.expiresAt ?? (a.ttl !== undefined && a.ttl > 0 ? now + a.ttl : undefined);
-      const entityKey = a.path + NUL + a.type;
+      const entityKey = a.path + SEP + a.type;
       // Replace semantics: a fresh annotation for the same (swarm, path, type)
       // overwrites the previous one IN PLACE — the original id is kept so
       // releaseOrDeleteAnnotation stays valid (mirrors sqlite Edge S1).
@@ -1006,7 +1007,7 @@ export class ChunkDbStore implements SwarmStore {
     return this.serialized(async () => {
       for (const a of this.scanAll<ArtifactAnnotation>(NS.annotation)) {
         if (a.id === annotationId) {
-          this.db.delete(NS.annotation, keyOf(a.swarmId, a.path + NUL + a.type));
+          this.db.delete(NS.annotation, keyOf(a.swarmId, a.path + SEP + a.type));
           return true;
         }
       }

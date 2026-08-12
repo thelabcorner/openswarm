@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { openChunkDatabase, type ChunkSqlite, type ChunkStatement } from "./database";
 import { compress, decompress, type CodecName } from "./codec";
 import { encode, decode } from "./serde";
 import { packChunk, parseChunk, decodeBlock, type ParsedChunk } from './chunk-format';
@@ -19,28 +19,35 @@ interface PointRow { chunk_id:number; slot:number; payload:Uint8Array; }
 interface ChunkPayloadRow { id:number; payload:Uint8Array; }
 
 export class ChunkDB {
-  readonly sqlite: Database;
+  private _sqlite: ChunkSqlite | undefined;
   readonly codec: CodecName;
   readonly chunkRecords: number;
   readonly blockRecords: number;
   readonly chunkCacheSize: number;
   readonly blockCacheSize: number;
+  readonly path: string;
+  private readonly options: ChunkDBOptions;
   private chunkCache = new Map<number, ParsedChunk>();
   private blockCache = new Map<string, any[]>();
   private locCache = new Map<string, { chunk_id:number; slot:number } | null>();
   private deltaCache = new Map<string, { tombstone:boolean; value?:any } | null>();
 
-  private qChunkInsert; private qDirInsert; private qDeltaUpsert; private qDeltaGet;
-  private qPointGet; private qChunkGet; private qDeleteDirNamespace; private qDeleteChunksNamespace;
-  private qDeleteDeltasNamespace; private qDeltaDelete;
-  private qKeys; private qDirCount;
+  private qChunkInsert!: ChunkStatement; private qDirInsert!: ChunkStatement; private qDeltaUpsert!: ChunkStatement; private qDeltaGet!: ChunkStatement;
+  private qPointGet!: ChunkStatement; private qChunkGet!: ChunkStatement; private qDeleteDirNamespace!: ChunkStatement; private qDeleteChunksNamespace!: ChunkStatement;
+  private qDeleteDeltasNamespace!: ChunkStatement; private qDeltaDelete!: ChunkStatement;
+  private qKeys!: ChunkStatement; private qDirCount!: ChunkStatement;
 
   /** Namespaces whose delta override rows are currently being flushed by
-   * compact() — suppresses re-entrant auto-compaction from putMany. */
+   * compact() - suppresses re-entrant auto-compaction from putMany. */
   private compacting = new Set<string>();
 
   constructor(path = "chunkdb.sqlite", opts: ChunkDBOptions = {}) {
-    this.sqlite = new Database(path, { create: true, strict: true });
+    // Opening is DEFERRED to ready(): the backing driver is picked per runtime
+    // via dynamic import (Bun vs Node/Desktop), so merely importing this class
+    // must never touch `bun:sqlite` (a static import would kill the whole
+    // plugin bundle under the Node-based Desktop host).
+    this.path = path;
+    this.options = opts;
     this.codec = opts.codec ?? "auto-speed";
     // Empirically tuned Bun profiles. Macrochunks amortize SQLite row/page overhead;
     // microblocks independently bound decompression amplification.
@@ -50,29 +57,45 @@ export class ChunkDB {
     this.blockRecords = opts.blockRecords ?? profileBlock;
     this.chunkCacheSize = opts.chunkCacheSize ?? 512;
     this.blockCacheSize = opts.blockCacheSize ?? 4096;
-    if (opts.wal ?? true) this.sqlite.run("PRAGMA journal_mode=WAL;");
-    this.sqlite.run(`PRAGMA synchronous=${opts.synchronous ?? "NORMAL"};`);
-    this.sqlite.run("PRAGMA temp_store=MEMORY;");
-    this.sqlite.run("PRAGMA foreign_keys=ON;");
-    this.sqlite.run("PRAGMA busy_timeout=5000;");
-    this.sqlite.run("PRAGMA cache_size=-16384;");
+  }
+
+  /** Open the backing database (idempotent). Must complete before any other
+   * method. Picks bun:sqlite under Bun and node:sqlite under Node. */
+  async ready(): Promise<void> {
+    if (this._sqlite) return;
+    const sqlite = await openChunkDatabase(this.path, { create: true, strict: true });
+    this._sqlite = sqlite;
+    const opts = this.options;
+    if (opts.wal ?? true) this._sqlite.run("PRAGMA journal_mode=WAL;");
+    this._sqlite.run(`PRAGMA synchronous=${opts.synchronous ?? "NORMAL"};`);
+    this._sqlite.run("PRAGMA temp_store=MEMORY;");
+    this._sqlite.run("PRAGMA foreign_keys=ON;");
+    this._sqlite.run("PRAGMA busy_timeout=5000;");
+    this._sqlite.run("PRAGMA cache_size=-16384;");
     this.init();
-    this.qChunkInsert = this.sqlite.query(`INSERT INTO cdb_chunks(namespace, codec, record_count, raw_size, stored_size, payload) VALUES($namespace,'blocked-v2',$recordCount,$rawSize,$storedSize,$payload)`);
-    this.qDirInsert = this.sqlite.query(`INSERT OR REPLACE INTO cdb_directory(namespace,key,chunk_id,slot) VALUES($namespace,$key,$chunkId,$slot)`);
-    this.qDeltaUpsert = this.sqlite.query(`INSERT INTO cdb_delta(namespace,key,codec,raw_size,stored_size,payload,tombstone,updated_at) VALUES($namespace,$key,$codec,$rawSize,$storedSize,$payload,$tombstone,$updatedAt) ON CONFLICT(namespace,key) DO UPDATE SET codec=excluded.codec,raw_size=excluded.raw_size,stored_size=excluded.stored_size,payload=excluded.payload,tombstone=excluded.tombstone,updated_at=excluded.updated_at`);
-    this.qDeltaGet = this.sqlite.query(`SELECT codec,payload,tombstone FROM cdb_delta WHERE namespace=$namespace AND key=$key`);
-    this.qPointGet = this.sqlite.query(`SELECT d.chunk_id,d.slot,c.payload FROM cdb_directory d JOIN cdb_chunks c ON c.id=d.chunk_id WHERE d.namespace=$namespace AND d.key=$key`);
-    this.qChunkGet = this.sqlite.query(`SELECT id,payload FROM cdb_chunks WHERE id=$id`);
-    this.qDeleteDirNamespace = this.sqlite.query(`DELETE FROM cdb_directory WHERE namespace=$namespace`);
-    this.qDeleteChunksNamespace = this.sqlite.query(`DELETE FROM cdb_chunks WHERE namespace=$namespace`);
-    this.qDeleteDeltasNamespace = this.sqlite.query(`DELETE FROM cdb_delta WHERE namespace=$namespace`);
-    this.qDeltaDelete = this.sqlite.query(`DELETE FROM cdb_delta WHERE namespace=$namespace AND key=$key`);
-    this.qKeys = this.sqlite.query(`SELECT key FROM cdb_directory WHERE namespace=$ns UNION SELECT key FROM cdb_delta WHERE namespace=$ns`);
-    this.qDirCount = this.sqlite.query(`SELECT COUNT(*) n FROM cdb_directory WHERE namespace=$ns`);
+    this.qChunkInsert = this._sqlite.query(`INSERT INTO cdb_chunks(namespace, codec, record_count, raw_size, stored_size, payload) VALUES($namespace,'blocked-v2',$recordCount,$rawSize,$storedSize,$payload)`);
+    this.qDirInsert = this._sqlite.query(`INSERT OR REPLACE INTO cdb_directory(namespace,key,chunk_id,slot) VALUES($namespace,$key,$chunkId,$slot)`);
+    this.qDeltaUpsert = this._sqlite.query(`INSERT INTO cdb_delta(namespace,key,codec,raw_size,stored_size,payload,tombstone,updated_at) VALUES($namespace,$key,$codec,$rawSize,$storedSize,$payload,$tombstone,$updatedAt) ON CONFLICT(namespace,key) DO UPDATE SET codec=excluded.codec,raw_size=excluded.raw_size,stored_size=excluded.stored_size,payload=excluded.payload,tombstone=excluded.tombstone,updated_at=excluded.updated_at`);
+    this.qDeltaGet = this._sqlite.query(`SELECT codec,payload,tombstone FROM cdb_delta WHERE namespace=$namespace AND key=$key`);
+    this.qPointGet = this._sqlite.query(`SELECT d.chunk_id,d.slot,c.payload FROM cdb_directory d JOIN cdb_chunks c ON c.id=d.chunk_id WHERE d.namespace=$namespace AND d.key=$key`);
+    this.qChunkGet = this._sqlite.query(`SELECT id,payload FROM cdb_chunks WHERE id=$id`);
+    this.qDeleteDirNamespace = this._sqlite.query(`DELETE FROM cdb_directory WHERE namespace=$namespace`);
+    this.qDeleteChunksNamespace = this._sqlite.query(`DELETE FROM cdb_chunks WHERE namespace=$namespace`);
+    this.qDeleteDeltasNamespace = this._sqlite.query(`DELETE FROM cdb_delta WHERE namespace=$namespace`);
+    this.qDeltaDelete = this._sqlite.query(`DELETE FROM cdb_delta WHERE namespace=$namespace AND key=$key`);
+    this.qKeys = this._sqlite.query(`SELECT key FROM cdb_directory WHERE namespace=$ns UNION SELECT key FROM cdb_delta WHERE namespace=$ns`);
+    this.qDirCount = this._sqlite.query(`SELECT COUNT(*) n FROM cdb_directory WHERE namespace=$ns`);
+  }
+
+  /** The opened database — throws until ready() completes (single guard point
+   * for every public method). */
+  get sqlite(): ChunkSqlite {
+    if (!this._sqlite) throw new Error("ChunkDB: call await ready() before use");
+    return this._sqlite;
   }
 
   private init() {
-    this.sqlite.run(`
+    this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS cdb_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS cdb_chunks(id INTEGER PRIMARY KEY,namespace TEXT NOT NULL,codec TEXT NOT NULL,record_count INTEGER NOT NULL,raw_size INTEGER NOT NULL,stored_size INTEGER NOT NULL,payload BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS cdb_chunks_ns ON cdb_chunks(namespace);
@@ -167,7 +190,7 @@ export class ChunkDB {
     const cacheKey=this.ck(namespace,key);
     let dc=this.deltaCache.get(cacheKey);
     if(dc === undefined){
-      const d=this.qDeltaGet.get({namespace,key}) as DeltaRow|null;
+      const d=this.qDeltaGet.get({namespace,key}) as unknown as DeltaRow | null;
       if(d){ dc=d.tombstone ? {tombstone:true} : {tombstone:false,value:decode(decompress(d.codec,d.payload!))}; }
       else dc=null;
       this.deltaCache.set(cacheKey,dc);
@@ -175,7 +198,7 @@ export class ChunkDB {
     if(dc){ return dc.tombstone ? undefined : dc.value as T; }
     let loc=this.locCache.get(cacheKey);
     if(loc === undefined){
-      const r=this.qPointGet.get({namespace,key}) as PointRow|null;
+      const r=this.qPointGet.get({namespace,key}) as unknown as PointRow | null;
       if(!r){ this.locCache.set(cacheKey,null); return undefined; }
       loc={chunk_id:r.chunk_id,slot:r.slot}; this.locCache.set(cacheKey,loc);
       return this.readSlot(r.chunk_id,r.slot,r.payload) as T;
@@ -183,7 +206,7 @@ export class ChunkDB {
     if(!loc)return undefined;
     const parsed=this.chunkCache.get(loc.chunk_id);
     if(parsed)return this.readSlot(loc.chunk_id,loc.slot,parsed.payload) as T;
-    const row=this.qChunkGet.get({id:loc.chunk_id}) as ChunkPayloadRow|null;
+    const row=this.qChunkGet.get({id:loc.chunk_id}) as unknown as ChunkPayloadRow | null;
     if(!row)return undefined;
     return this.readSlot(loc.chunk_id,loc.slot,row.payload) as T;
   }
@@ -279,7 +302,7 @@ export class ChunkDB {
   }
 
   stats(namespace?:string){const where=namespace?' WHERE namespace=$namespace':'';const params=namespace?{namespace}:undefined;const chunks=this.sqlite.query(`SELECT COUNT(*) n,COALESCE(SUM(record_count),0) records,COALESCE(SUM(raw_size),0) raw,COALESCE(SUM(stored_size),0) stored FROM cdb_chunks${where}`).get(params as any) as any;const deltas=this.sqlite.query(`SELECT COUNT(*) n,COALESCE(SUM(raw_size),0) raw,COALESCE(SUM(stored_size),0) stored FROM cdb_delta${where}`).get(params as any) as any;return{chunks,deltas,logicalRawBytes:Number(chunks.raw)+Number(deltas.raw),storedPayloadBytes:Number(chunks.stored)+Number(deltas.stored),payloadRatio:(Number(chunks.stored)+Number(deltas.stored))/Math.max(1,Number(chunks.raw)+Number(deltas.raw))};}
-  close(){this.sqlite.close();}
+  close(){ if (this._sqlite) { this._sqlite.close(); this._sqlite = undefined; } }
 }
 
 /** Exclusive upper bound for a SQLite prefix range scan: `prefixEnd("abc")`

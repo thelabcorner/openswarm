@@ -69,11 +69,11 @@ function ctx(sessionID: string): any {
 let hooks: Hooks | undefined;
 let tool: Record<string, any>;
 
-async function initPlugin(): Promise<void> {
+async function initPlugin(options: Record<string, unknown> = {}): Promise<void> {
   disposeSwarmRuntime();
   const dir = mkdtempSync(join(tmpdir(), "swarms-revive-"));
   dirs.push(dir);
-  hooks = await swarmPlugin(pluginInput(makeClient()), { dataDir: dir });
+  hooks = await swarmPlugin(pluginInput(makeClient()), { dataDir: dir, ...options });
   tool = hooks.tool ?? {};
 }
 
@@ -172,7 +172,9 @@ describe("swarm_revive revive (keep)", () => {
   });
 
   test("revive+keep respawns stopped members when includeStopped, releases stuck tasks, flips status active", async () => {
-    await initPlugin();
+    // This test ages a task lease via raw SQL, so it runs on the SQLITE
+    // backend explicitly (the chunkdb backend has no `.db` SQL surface).
+    await initPlugin({ storeBackend: "sqlite" });
     const swarmId = await createSwarm("rev-keep");
     const { memberId } = await spawnWorker(swarmId, "w1");
     const before = (await rt().core.store.getMemberById(memberId))!;

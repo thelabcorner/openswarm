@@ -1,8 +1,9 @@
 import { test, expect } from "bun:test";
 import { ChunkDB } from "../src";
 
-test("chunk roundtrip and delta override", () => {
+test("chunk roundtrip and delta override", async () => {
   const db = new ChunkDB(":memory:", { chunkRecords: 8 });
+  await db.ready();
   db.putMany("n", Array.from({length:32},(_,i)=>[`k${i}`,{i,s:"repeat repeat repeat",a:[i,i+1]}] as [string,any]));
   expect(db.get("n","k17")).toEqual({i:17,s:"repeat repeat repeat",a:[17,18]});
   db.put("n","k17",{i:170});
@@ -15,8 +16,9 @@ test("chunk roundtrip and delta override", () => {
   db.close();
 });
 
-test("keys(namespace, prefix?) lists live keys with JS-verified prefix filtering", () => {
+test("keys(namespace, prefix?) lists live keys with JS-verified prefix filtering", async () => {
   const db = new ChunkDB(":memory:", { chunkRecords: 8 });
+  await db.ready();
   db.putMany("n", [["alpha/1",1],["alpha/2",2],["beta/1",3]] as [string,any][]);
   db.put("n","alpha/3",4);            // delta row
   db.delete("n","beta/1");            // tombstone delta
@@ -30,8 +32,9 @@ test("keys(namespace, prefix?) lists live keys with JS-verified prefix filtering
   db.close();
 });
 
-test("auto-compaction: absolute threshold flushes after 5000 writes", () => {
+test("auto-compaction: absolute threshold flushes after 5000 writes", async () => {
   const db = new ChunkDB(":memory:", { chunkRecords: 16 });
+  await db.ready();
   // A large directory makes the ratio path (>30% of 20k records = 6000 deltas)
   // unreachable for a 5000-write burst, so the ABSOLUTE threshold (5000
   // unflushed writes) is what fires — proving the write-count bound works.
@@ -45,8 +48,9 @@ test("auto-compaction: absolute threshold flushes after 5000 writes", () => {
   db.close();
 });
 
-test("auto-compaction: ratio threshold flushes at ~30% of directory records", () => {
+test("auto-compaction: ratio threshold flushes at ~30% of directory records", async () => {
   const db = new ChunkDB(":memory:", { chunkRecords: 8 });
+  await db.ready();
   db.putMany("n", Array.from({length:1000},(_,i)=>[`k${i}`,i] as [string,any]));
   for (let i = 0; i < 300; i++) db.put("n", `k${i}`, i + 1000);
   // 300 deltas = exactly 30% of the 1000 directory records -> the ratio check
@@ -57,8 +61,9 @@ test("auto-compaction: ratio threshold flushes at ~30% of directory records", ()
   db.close();
 });
 
-test("adaptive block sizing handles small and large values", () => {
+test("adaptive block sizing handles small and large values", async () => {
   const db = new ChunkDB(":memory:", { chunkRecords: 4 });
+  await db.ready();
   const small = Array.from({length:8},(_,i)=>[`s${i}`,{t:"tiny"}] as [string,any]);
   const large = Array.from({length:8},(_,i)=>[`l${i}`,{blob:"x".repeat(10000),i}] as [string,any]);
   db.putMany("n", small);
