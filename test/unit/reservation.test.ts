@@ -83,8 +83,9 @@ describe("durable reservation — later-ready DAG tasks", () => {
     expect(result.assigned.length).toBe(0);
     expect(result.readyUnassigned).toContain("t-held");
     const task = await store.listTasks(swarmId);
-    expect(task[0]!.ownerMemberId).toBeUndefined();
-    expect(task[0]!.reservedFor).toBe("intended"); // still reserved
+    const held = task.find((t: any) => t.id === "t-held")!;
+    expect(held.ownerMemberId).toBeUndefined();
+    expect(held.reservedFor).toBe("intended"); // still reserved
   });
 
   test("reservation expires after TTL and the task frees to affinity with a fallback recorded", async () => {

@@ -2,7 +2,8 @@ import type { AgentRuntime } from "../runtime/runtime-types.js";
 import type { SwarmMessage } from "../core/types.js";
 import { DEFAULT_MAX_DELIVERY_ATTEMPTS } from "../core/types.js";
 import type { SwarmStore } from "../storage/store.js";
-import { formatEnvelope } from "./formatter.js";
+import { formatEnvelope, senderNames } from "./formatter.js";
+import { enrichForeignSenderNames } from "./senders.js";
 
 export interface BrokerOptions {
   /** Maximum messages batched into a single wake delivery. */
@@ -21,10 +22,19 @@ export interface BrokerOptions {
    * delivery retry budget — the plugin wires this to notify the sender.
    * (audit/messaging F-M5) */
   onMessageFailed?: (failed: SwarmMessage) => void | Promise<void>;
+  /** Called when a delivery attempt fails (the message is reverted to queued
+   * with the error recorded). The plugin wires this to detect model usage-limit
+   * signals in delivery errors (stall auto-diagnosis: a provider limit hit
+   * blocks delivery with a limit/quota/rate/429/billing error). */
+  onDeliveryError?: (memberId: string, error: string) => void | Promise<void>;
   /** Optional predicate: when it returns true for a member, delivery is skipped
    * (mail stays `queued`) and the next delivery attempt happens later. Used to
    * defer mail while the user is directly chatting with a member. */
   shouldDeferDelivery?: (memberId: string) => boolean | Promise<boolean>;
+  /** Emergency kill switch (t-emergency): when true, ALL delivery halts —
+   * deliverToIdleMember returns 0 (mail stays queued, resumes after clear).
+   * Freezes swarm machinery without touching the user's chat. */
+  shouldBlockDelivery?: () => boolean;
 }
 
 /**
@@ -47,6 +57,11 @@ export class Broker {
    * guarantees a message is claimed by exactly one wake.
    */
   async deliverToIdleMember(memberId: string, memberSessionId: string): Promise<number> {
+    // Emergency kill switch (t-emergency): while tripped, ALL delivery halts —
+    // mail stays `queued` and is delivered after clear. The machinery freezes;
+    // the user's chat is untouched.
+    if (this.options.shouldBlockDelivery?.()) return 0;
+
     // Defer while the user is directly chatting with the member — the member is
     // answering the user, not the swarm. Mail stays `queued` (not marked
     // scheduled), so it's delivered on the first normal attempt after the lull.
@@ -79,25 +94,28 @@ export class Broker {
     const toDeliver = batch.slice(0, claimed);
 
     const names = await this.memberNames(memberId);
+    // Cross-swarm messages carry a sender from another swarm — resolve those
+    // ids to `name@swarm` so the recipient always sees the origin.
+    await enrichForeignSenderNames(this.store, toDeliver, names);
     const self = await this.store.getMemberById(memberId);
     const ctx = await this.memberContext(memberId, names);
-    const inbox = toDeliver.map((m) => formatEnvelope(m, names)).join("\n");
+    const inbox = toDeliver.map((m) => formatEnvelope(m, names)).join("\n\n");
     // Noreply: when EVERY message in the batch is fire-and-forget, the member
     // is explicitly told no response is expected — saves a mailbox turn and
     // cooldown that an ack-only reply would have burned (noreply feature).
     const allNoreply = toDeliver.length > 0 && toDeliver.every((m) => m.noreply);
     const replyLine = allNoreply
-      ? "None of these messages expect a reply — do not respond unless you can act or escalate."
-      : "Reply to senders with swarm_message (to: <name>) or swarm_reply with the message id where a response is needed.";
+      ? "[no replies needed — do not respond unless you can act or escalate]"
+      : "[reply where needed — swarm_message (to: <name>) or swarm_reply ([msg:...])]";
+    const senders = senderNames(toDeliver, names);
+    const header =
+      toDeliver.length === 1
+        ? `[NEW MESSAGE FROM: ${senders.join(", ")}]`
+        : `[NEW MESSAGES (${toDeliver.length}) FROM: ${senders.join(", ")}]`;
     // A normal user turn (not synthetic) prefixed with the necessary swarm
     // context so the receiving agent can act: its identity, the swarm id
-    // (required as a tool argument), and the reply protocol.
-    const promptText = [
-      `[SWARM INBOX — ${toDeliver.length}]`,
-      ctx,
-      replyLine,
-      inbox,
-    ].join("\n");
+    // (required as a tool argument), and the sender of each message.
+    const promptText = [header, ctx, replyLine, "", inbox].join("\n");
 
     try {
       // Deliver using the RECIPIENT's configured model AND agent — in a
@@ -121,21 +139,19 @@ export class Broker {
     return toDeliver.length;
   }
 
-  /** Compact but sufficient context so an injected message is self-contained. */
+  /**
+   * One compact identity row. The swarm agent's system prompt already teaches
+   * the reply protocol (swarm_message/swarm_reply/roster), so per-delivery
+   * context is just: who I am, which swarm, and who my peers are.
+   */
   private async memberContext(memberId: string, names: Map<string, string>): Promise<string> {
     const self = await this.store.getMemberById(memberId);
     if (!self) return "";
     const swarm = await this.store.getSwarm(self.swarmId);
-    const role = self.role && self.role.toLowerCase() !== self.name.toLowerCase() ? `, ${self.role}` : "";
     const peers = names.size > 1
       ? [...names.entries()].filter(([id]) => id !== memberId).map(([, n]) => n).join(", ")
       : "";
-    const lines = [
-      `You are ${self.name}${role} in swarm ${swarm?.name ?? self.swarmId} (swarmId: ${self.swarmId}).`,
-      `Reply to senders with swarm_message (to: <name>)${peers ? `; peers: ${peers}` : ""}.`,
-      `Use swarm_reply with the message id to continue a thread.`,
-    ];
-    return lines.join("\n");
+    return `@${self.name} | ${swarm?.name ?? self.swarmId} (${self.swarmId})${peers ? ` | peers: ${peers}` : ""}`;
   }
 
   private async memberNames(memberId: string): Promise<Map<string, string>> {
@@ -167,6 +183,15 @@ export class Broker {
   private async revertScheduled(memberId: string, msgs: SwarmMessage[], err: unknown): Promise<void> {
     const maxAttempts = this.options.maxDeliveryAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS;
     const errorText = err instanceof Error ? err.message : String(err);
+    // Surface the failure to the plugin (usage-limit detection): the delivery
+    // error may be a model limit hit — advisory, never fails the revert.
+    if (this.options.onDeliveryError) {
+      try {
+        await this.options.onDeliveryError(memberId, errorText);
+      } catch (notifyErr) {
+        console.error(`[swarm] delivery-error hook failed: ${(notifyErr as Error).message}`);
+      }
+    }
     for (const m of msgs) {
       const reverted = await this.store.revertMessageToQueuedWithError(m.id, memberId, errorText);
       // Budget exhausted: mark failed and notify the sender exactly once.

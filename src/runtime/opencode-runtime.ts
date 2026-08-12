@@ -17,7 +17,16 @@ function isZenFree(modelID: string): boolean {
   return /(^|-)(free|free-)/i.test(modelID);
 }
 
-export { tierForProvider, isZenFree };
+/** Map a provider ref (possibly a tier label used by mistake) to a real
+ * provider id. Unknown ids pass through unchanged so custom providers work. */
+function normalizeProvider(providerID: string): string {
+  const p = providerID.trim();
+  if (p === "go") return "opencode-go";
+  if (p === "zen" || p === "zen-free") return "opencode";
+  return p;
+}
+
+export { tierForProvider, isZenFree, normalizeProvider };
 
 /** Minimal structural client surface we require from the plugin-provided SDK client. */
 export interface OpenCodeClientLike {
@@ -32,6 +41,9 @@ export interface OpenCodeClientLike {
     prompt(options: any): Promise<any>;
     promptAsync(options: any): Promise<any>;
     todo(options: any): Promise<any>;
+    /** v1-gen permission reply: POST /session/{id}/permissions/{permissionID}
+     * with body { response: "once" | "always" | "reject" }. */
+    postSessionIdPermissionsPermissionId?(options: any): Promise<any>;
   };
   event?: {
     subscribe(options?: any): Promise<any>;
@@ -274,26 +286,80 @@ export class OpenCodeRuntime implements AgentRuntime {
   }
 
   /**
-   * Resolve a member model reference to a real, available model. Maps tier
-   * labels used by mistake ("go"/"zen"/"zen-free") to their real provider ids
-   * and returns undefined if the provider/model pair is unavailable — the
-   * caller then falls back to a default instead of erroring the spawn.
+   * Resolve a member model reference to a real, available model. Tolerant of
+   * the sloppy refs agents produce:
+   * - tier labels used as provider ("go"/"zen"/"zen-free") are mapped to their
+   *   real provider ids;
+   * - a modelID-only ref (no provider) matches ANY provider, preferring
+   *   opencode-go then opencode;
+   * - a display name (e.g. "DeepSeek V4 Flash") matches by model `name`;
+   * - matching is case-insensitive as a last resort.
+   * Returns undefined when the ref cannot be resolved — the caller then falls
+   * back down its priority chain instead of erroring the spawn.
    */
   async resolveModel(model?: { providerID?: string; modelID?: string }): Promise<{ providerID: string; modelID: string } | undefined> {
-    if (!model?.providerID || !model.modelID) return undefined;
-    let providerID = model.providerID;
-    if (providerID === "go") providerID = "opencode-go";
-    else if (providerID === "zen" || providerID === "zen-free") providerID = "opencode";
     const all = await this.listModels();
-    const hit = all.find((m) => m.providerID === providerID && m.modelID === model.modelID);
-    return hit ? { providerID: hit.providerID, modelID: hit.modelID } : undefined;
+    if (!all.length) return undefined;
+    if (!model?.providerID && !model?.modelID) return undefined;
+    const wantProvider = model.providerID ? normalizeProvider(model.providerID) : undefined;
+    const wantModel = model.modelID?.trim() ? model.modelID.trim() : undefined;
+    if (!wantProvider && !wantModel) return undefined;
+
+    if (wantProvider && wantModel) {
+      const hit = all.find((m) => m.providerID === wantProvider && m.modelID === wantModel);
+      if (hit) return { providerID: hit.providerID, modelID: hit.modelID };
+      const ci = all.find(
+        (m) => m.providerID.toLowerCase() === wantProvider.toLowerCase() && m.modelID.toLowerCase() === wantModel.toLowerCase(),
+      );
+      if (ci) return { providerID: ci.providerID, modelID: ci.modelID };
+      return undefined;
+    }
+
+    // modelID-only (or name-only) ref: match any provider, prefer go then zen.
+    if (wantModel) {
+      const exact = all.filter((m) => m.modelID === wantModel);
+      const byCi = exact.length ? exact : all.filter((m) => m.modelID.toLowerCase() === wantModel.toLowerCase());
+      const byName = byCi.length ? byCi : all.filter((m) => m.name && m.name.toLowerCase() === wantModel.toLowerCase());
+      if (byName.length) {
+        const preferred = byName.find((m) => m.providerID === "opencode-go")
+          ?? byName.find((m) => m.providerID === "opencode")
+          ?? byName[0]!;
+        return { providerID: preferred.providerID, modelID: preferred.modelID };
+      }
+      return undefined;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Answer a pending permission prompt for a session (the coordinator replying
+   * to a member's stall via swarm_permissions). Posts to the v1-gen endpoint
+   * POST /session/{id}/permissions/{permissionID} with body { response }.
+   * Returns TRUE on success; FALSE (never throws) when the method is missing,
+   * the call throws, or the response carries an error (404 = already answered
+   * or expired — the caller then marks the record replied instead).
+   */
+  async replyPermission(sessionID: string, permissionID: string, response: "once" | "always" | "reject"): Promise<boolean> {
+    if (!this.client.session.postSessionIdPermissionsPermissionId) return false;
+    try {
+      const res = await this.client.session.postSessionIdPermissionsPermissionId({
+        body: { response },
+        path: { id: sessionID, permissionID },
+        query: this.q(),
+      });
+      if ((res as any)?.error) return false;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
    * Fetch a session's todo list (the OpenCode todolist tool state, per-session).
    * Lets swarm members read each other's in-progress todo items so they can see
    * what a peer is actively doing — a cross-member redundancy probe. Returns
-   * [] on any error (todo may not exist / be unreachable).
+   * [] on any error (todo may not exist / unreachable).
    */
   async getSessionTodos(sessionID: string): Promise<Array<{ content: string; status: string; priority: string }>> {
     try {

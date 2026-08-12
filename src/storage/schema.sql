@@ -221,6 +221,56 @@ CREATE TABLE IF NOT EXISTS swarm_subscription (
 CREATE INDEX IF NOT EXISTS idx_subscription_swarm
   ON swarm_subscription(swarm_id);
 
+CREATE TABLE IF NOT EXISTS swarm_pending_permission (
+  id TEXT PRIMARY KEY,
+  swarm_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  pattern TEXT,
+  title TEXT,
+  response TEXT,
+  responded_at INTEGER,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+  FOREIGN KEY(member_id) REFERENCES swarm_member(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_perm_swarm
+  ON swarm_pending_permission(swarm_id, response);
+
+CREATE TABLE IF NOT EXISTS swarm_deliverable (
+  id TEXT PRIMARY KEY,
+  swarm_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  task_id TEXT,
+  summary TEXT NOT NULL,
+  refs_json TEXT,
+  files_json TEXT,
+  verdict TEXT,
+  verdict_by TEXT,
+  verdict_at INTEGER,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+  FOREIGN KEY(member_id) REFERENCES swarm_member(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_deliverable_swarm
+  ON swarm_deliverable(swarm_id, verdict, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS swarm_contract (
+  id TEXT PRIMARY KEY,
+  swarm_id TEXT NOT NULL,
+  key_pattern TEXT NOT NULL,
+  schema_json TEXT NOT NULL,
+  description TEXT,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+  UNIQUE(swarm_id, key_pattern)
+);
+CREATE INDEX IF NOT EXISTS idx_contract_swarm ON swarm_contract(swarm_id);
+
 CREATE TABLE IF NOT EXISTS swarm_event (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   swarm_id TEXT NOT NULL,

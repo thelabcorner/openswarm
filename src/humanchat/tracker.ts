@@ -51,6 +51,9 @@ export class HumanChatTracker {
    * registry nor a known prefix is a HUMAN message. */
   static readonly SELF_TEXT_PREFIXES = [
     "[SWARM INBOX —",
+    "[NEW MESSAGE FROM:",
+    "[NEW MESSAGES (",
+    "[NO NEW MESSAGES]",
     "[TEAM SYNC —",
     "You went idle while working on task",
     "[WATCHDOG]",

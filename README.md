@@ -85,9 +85,21 @@ Add the built bundle to your OpenCode config (`opencode.json` or `opencode.jsonc
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["/absolute/path/to/openswarm/dist/index.js"]
+  "plugin": [
+    ["/absolute/path/to/openswarm/dist/index.js", {
+      "allowAllMemberPermissions": true,
+      "defaultMemberModel": { "providerID": "opencode-go", "modelID": "deepseek-v4-flash" }
+    }]
+  ]
 }
 ```
+
+Plugin options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `allowAllMemberPermissions` | `false` | Auto-allow every permission requested by swarm members (headless sessions never wedge on prompts). |
+| `defaultMemberModel` | `opencode-go` / `deepseek-v4-flash` | Model used for spawned members when no explicit model is given and no last-used model is known. |
 
 Then restart OpenCode. Verify the plugin is live and the runtime is compatible:
 
@@ -123,6 +135,20 @@ swarm_tasks(swarmId: "<swarm-id>", action: "list")
 ```
 
 Each member is a real OpenCode session — open it in the app and talk to it directly. When the reviewer completes, the coordinator is notified; you can also poll-free by relying on the completion notices.
+
+---
+
+## Model selection
+
+Members get a model via a deterministic priority chain — never a random runtime default:
+
+1. **Explicit `model` on the member** (validated; tolerant of tier labels like `"go"`, a bare `modelID`, or the model's display name)
+2. **Last-used tuple** for the swarm (remembered in-memory and persisted on the blackboard under `context/model/last-used`, so it survives restarts)
+3. **The coordinator's current session model** (your live model)
+4. **Config default** (`defaultMemberModel`, default `opencode-go` / `deepseek-v4-flash`)
+5. **Any available model** (zen-free preferred) — reported as `modelSource: "fallback"` so you know the default wasn't available
+
+Every spawn output reports `model` + `modelSource` (`requested | last-used | coordinator | default | fallback | none`) so you always see *why* a member got its model. Use `swarm_models` to confirm availability; you rarely need to set `model` yourself.
 
 ---
 

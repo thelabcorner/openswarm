@@ -79,7 +79,7 @@ describe("HumanChatTracker — classification", () => {
 
   test("known injected text prefixes classify as self", () => {
     const t = makeTracker(new FakeClock(), new StubStore());
-    expect(t.isSelfInjection(undefined, "[SWARM INBOX — 3]")).toBe(true);
+    expect(t.isSelfInjection(undefined, "[NEW MESSAGES (3) FROM: alice, bob]")).toBe(true);
     expect(t.isSelfInjection(undefined, "[TEAM SYNC — s1]")).toBe(true);
     expect(t.isSelfInjection(undefined, "You went idle while working on task")).toBe(true);
     expect(t.isSelfInjection(undefined, "[WATCHDOG] your session appears stalled")).toBe(true);

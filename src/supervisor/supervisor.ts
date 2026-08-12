@@ -1,4 +1,5 @@
 import type { SwarmStore } from "../storage/store.js";
+import { recordEvent } from "../core/events.js";
 
 /**
  * True when a session.error payload represents an ABORT/interrupt (the user
@@ -67,6 +68,18 @@ export class Supervisor {
     switch (event.type) {
       case "session.idle":
         await this.store.updateMemberStatus(member.id, "idle", { lastActiveAt: now });
+        // Timeline: record the working→idle transition ONLY (not every status
+        // change) — a member that finished a turn mid-task is the interesting
+        // idle. Best-effort; never fails the state reduction.
+        if (member.status === "working") {
+          await recordEvent(this.store, {
+            swarmId: member.swarmId,
+            type: "member.idle",
+            actorMemberId: member.id,
+            entityType: "member",
+            entityId: member.id,
+          });
+        }
         effects.wake.push(member.id);
         break;
       case "session.status":
@@ -107,6 +120,15 @@ export class Supervisor {
           await this.store.releaseTask(member.currentTaskId);
         }
         await this.store.updateMemberStatus(member.id, "stopped", { currentTaskId: null });
+        // Timeline: a →stopped transition (member.stopped) — the durable
+        // tombstone event for a member whose session was deleted.
+        await recordEvent(this.store, {
+          swarmId: member.swarmId,
+          type: "member.stopped",
+          actorMemberId: member.id,
+          entityType: "member",
+          entityId: member.id,
+        });
         break;
       case "session.created":
         // A newly created child enters "starting"; the coordinator flow

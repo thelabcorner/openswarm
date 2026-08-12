@@ -2,6 +2,7 @@ import type { AgentRuntime } from "../runtime/runtime-types.js";
 import type { Swarm, SwarmMember, SwarmTask, PathClaim, ArtifactAnnotation } from "../core/types.js";
 import type { SwarmStore } from "../storage/store.js";
 import { fence } from "../core/fence.js";
+import { recordEvent } from "../core/events.js";
 import { buildPrerequisites, recomputeReadiness, affinityScore } from "./dag.js";
 
 /** Default human-chat lull (mirrors DEFAULT_POLICIES.humanChatLullMs). */
@@ -59,6 +60,16 @@ export interface SchedulerResult {
 /** Minimum active `corpse` annotations on one path/area before the scheduler
  * emits a collective-hesitation warning (Hive H1, corpse pile). */
 export const CORPSE_PILE_THRESHOLD = 3;
+
+/** Scheduler options (all optional; the plugin wires the stall-diagnosis
+ * hook). */
+export interface SchedulerOptions {
+  /** Called when a task kickoff prompt fails (assignTask catch). The plugin
+   * uses this to detect model usage-limit signals in kickoff errors (stall
+   * auto-diagnosis: a limit hit fails the kickoff with a limit/quota/rate/429/
+   * billing error). Advisory — never changes assignment behavior. */
+  onKickoffError?: (memberId: string, error: unknown) => void | Promise<void>;
+}
 
 /**
  * Does a task's text mention a workspace path/area (e.g. "src/parser",
@@ -148,6 +159,7 @@ export class Scheduler {
   constructor(
     private store: SwarmStore,
     private runtime: AgentRuntime,
+    private options: SchedulerOptions = {},
   ) {}
 
   /**
@@ -237,6 +249,14 @@ export class Scheduler {
       if (t.status === "ready" && !t.ownerMemberId && (t.retryCount ?? 0) > maxRetries) {
         await this.store.updateTaskStatus(t.id, "failed");
         failedExceededRetries.push(t.id);
+        // Timeline: retry budget exhausted — the task is failed outright.
+        await recordEvent(this.store, {
+          swarmId: swarm.id,
+          type: "task.failed",
+          entityType: "task",
+          entityId: t.id,
+          payloadJson: JSON.stringify({ reason: "maxRetries exceeded" }),
+        });
       }
     }
 
@@ -446,6 +466,17 @@ export class Scheduler {
     const claimed = await this.store.claimTask(task.id, member.id, leaseMs);
     if (!claimed) return false;
 
+    // Timeline: a successful atomic claim (task.claimed). Best-effort; never
+    // fails the assignment.
+    await recordEvent(this.store, {
+      swarmId: swarm.id,
+      type: "task.claimed",
+      actorMemberId: member.id,
+      entityType: "task",
+      entityId: task.id,
+      payloadJson: JSON.stringify({ memberId: member.id }),
+    });
+
     await this.store.updateMemberStatus(member.id, "working", { currentTaskId: task.id, lastActiveAt: Date.now() });
     await this.store.updateTaskStatus(task.id, "working");
 
@@ -464,6 +495,15 @@ export class Scheduler {
       await this.store.releaseTask(task.id, { countAsRetry: false }).catch(() => undefined);
       await this.store.updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: Date.now() }).catch(() => undefined);
       console.error(`[swarm] scheduler kickoff failed for ${member.name}:`, (err as Error).message);
+      // Stall auto-diagnosis hook: a kickoff failure may be a model usage-limit
+      // hit (limit/quota/rate/429/billing) — surface it (advisory).
+      if (this.options.onKickoffError) {
+        try {
+          await this.options.onKickoffError(member.id, err);
+        } catch (hookErr) {
+          console.error(`[swarm] kickoff-error hook failed: ${(hookErr as Error).message}`);
+        }
+      }
       return false;
     }
   }

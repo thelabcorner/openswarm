@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SQLiteStore } from "../../src/storage/sqlite-store.ts";
 import { SwarmCore } from "../../src/core/swarm.ts";
 import { Scheduler } from "../../src/scheduler/scheduler.ts";
-import { fence, FENCE_MARKER } from "../../src/core/fence.ts";
+import { fence, FENCE_MARKER, FENCE_SHORT } from "../../src/core/fence.ts";
 import { formatEnvelope } from "../../src/messaging/formatter.ts";
 import type { AgentRuntime, RuntimeSession } from "../../src/runtime/runtime-types.ts";
 
@@ -113,9 +113,9 @@ describe("formatEnvelope fences peer message bodies", () => {
       },
       new Map([["mem-a", "peer-a"]]),
     );
-    expect(envelope).toContain(FENCE_MARKER);
+    expect(envelope).toContain(FENCE_SHORT);
     expect(envelope).toContain(INJECT);
-    // The directive must appear inside the fence, never as the envelope prefix.
+    // The directive must appear inside the quote fence, never as the envelope prefix.
     expect(envelope.startsWith(INJECT)).toBe(false);
     expect(envelope.startsWith("peer-a")).toBe(true);
   });

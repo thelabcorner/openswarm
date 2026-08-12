@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SQLiteStore } from "../../src/storage/sqlite-store.ts";
-import { swarmPlugin, swarmRuntime } from "../../src/plugin.ts";
+import { swarmPlugin, swarmRuntime, disposeSwarmRuntime } from "../../src/plugin.ts";
 import type { Hooks } from "@opencode-ai/plugin";
 import type { Permission } from "@opencode-ai/sdk";
 
@@ -85,6 +85,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+disposeSwarmRuntime();
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 

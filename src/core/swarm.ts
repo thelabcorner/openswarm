@@ -14,6 +14,7 @@ import type { SwarmStore } from "../storage/store.js";
 import { detectCycle } from "../scheduler/dag.js";
 import { DEFAULT_TASK_LEASE_MS } from "../scheduler/scheduler.js";
 import { routeNeed, renderNeedMessage } from "../messaging/need.js";
+import { extractFileMentions, extractMemberMentions } from "../messaging/mentions.js";
 import {
   consolidationIsNotable,
   renderConsolidationNotice,
@@ -29,6 +30,8 @@ export function swarmTaskLeaseMs(swarm: Pick<Swarm, "policies">): number {
 }
 import { formatEnvelope } from "../messaging/formatter.js";
 import { fence } from "./fence.js";
+import { recordEvent } from "./events.js";
+import { validateValueAgainstSchema, type JsonSchema } from "../storage/json-schema.js";
 
 /** Stable ID helpers (usable from tests without random globals). */
 export function makeId(prefix: string, rand: () => string = () => crypto.randomUUID()): string {
@@ -352,6 +355,16 @@ export class SwarmCore {
       await this.store.updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: Date.now() }).catch(() => undefined);
       throw err;
     }
+    // Timeline: the atomic claim succeeded — record who owns which task
+    // (task.claimed). Best-effort; never fails the assignment.
+    await recordEvent(this.store, {
+      swarmId: swarm.id,
+      type: "task.claimed",
+      actorMemberId: member.id,
+      entityType: "task",
+      entityId: input.taskId,
+      payloadJson: JSON.stringify({ memberId: member.id }),
+    });
     return { ...member, status: "working", currentTaskId: input.taskId };
   }
 
@@ -514,6 +527,18 @@ export class SwarmCore {
       await this.store.updateMemberStatus(member!.id, "idle", { lastActiveAt: now });
     }
 
+    // Timeline: member lifecycle is a key replay transition. Recorded once the
+    // member is fully registered (session created + status set) so a spawn that
+    // failed mid-flight leaves no phantom event. Best-effort.
+    await recordEvent(this.store, {
+      swarmId: swarm.id,
+      type: "member.spawned",
+      actorMemberId: swarm.coordinatorMemberId,
+      entityType: "member",
+      entityId: member!.id,
+      payloadJson: JSON.stringify({ name: member!.name, role: member!.role }),
+    });
+
     return {
       ...member!,
       sessionId: session.id,
@@ -578,6 +603,12 @@ export class SwarmCore {
      * NOT expected to reply. Rejected for kinds that demand action
      * (`request`, `blocker`, `handoff`, `review`) — those must stay replyable. */
     noreply?: boolean;
+    /** Cross-swarm: allow a member of a DIFFERENT swarm to message into this
+     * swarm (the sender is not a member of `swarmId`). The sender must still
+     * be a registered member of some swarm; the recipient is resolved inside
+     * the target swarm. Messages carry the sender's id — the rendering layer
+     * displays foreign senders as `name@swarm` so recipients see the origin. */
+    force?: boolean;
   }): Promise<SwarmMessage[]> {
     const swarm = await this.store.getSwarm(input.swarmId);
     if (!swarm) throw new Error(`no such swarm '${input.swarmId}'`);
@@ -589,14 +620,27 @@ export class SwarmCore {
       throw new Error("message body cannot be empty");
     }
 
+    // Sender resolution. Without force the sender must be a member of the
+    // TARGET swarm; with force any registered member of any swarm may send in
+    // (their own member row is authoritative — the id is never spoofable).
     let sender: SwarmMember | undefined;
     if (input.fromMemberId) {
-      sender = await this.getMember(input.swarmId, input.fromMemberId);
+      sender = input.force
+        ? await this.store.getMemberById(input.fromMemberId)
+        : await this.getMember(input.swarmId, input.fromMemberId);
     } else if (input.fromSessionId) {
       const bySession = await this.store.getMemberBySessionId(input.fromSessionId);
-      if (bySession && bySession.swarmId === input.swarmId) sender = bySession;
+      if (bySession && (input.force || bySession.swarmId === input.swarmId)) sender = bySession;
     }
-    if (!sender) throw new Error(`sender is not a member of swarm '${swarm.name}'`);
+    // Agent UX (cross-swarm): the most common cause is messaging a DIFFERENT
+    // swarm without force — the error names the exact remedy instead of
+    // dead-ending (mirrors the noreply violation message pattern).
+    if (!sender) {
+      throw new Error(
+        `sender is not a member of swarm '${swarm.name}' — ` +
+          `if the sender is a member of another swarm, pass force: true to message across swarms`,
+      );
+    }
 
     return this.store.transaction(async (tx) => {
       let targets: string[];
@@ -623,6 +667,33 @@ export class SwarmCore {
         targets = [recipient.id];
       }
 
+      // @mention auto-notify (GitHub-style): mentioning a member in the body
+      // pulls them into the conversation — the message is ALSO delivered to
+      // them (unless they're already a recipient, are the sender, or are not
+      // active). Broadcasts already reach everyone, so mentions add nothing.
+      const mentioned = extractMemberMentions(input.message, (await tx.listMembers(input.swarmId)).map((m) => m.name));
+      if (mentioned.length > 0) {
+        const members = await tx.listMembers(input.swarmId);
+        const targetSet = new Set(targets);
+        for (const m of members) {
+          if (!mentioned.includes(m.name)) continue;
+          if (m.id === sender.id) continue;
+          if (targetSet.has(m.id)) continue;
+          if (["stopped", "stopping", "failed"].includes(m.status)) continue;
+          targetSet.add(m.id);
+        }
+        targets = [...targetSet];
+      }
+
+      // LOOP-SAFETY INVARIANT (defense in depth): no worker may ever be a
+      // recipient of its own message, no matter how the target set was built
+      // (direct name, broadcast, mention, or any future path). The call-site
+      // checks above give the explicit UX errors; this final filter guarantees
+      // the invariant even if a new caller forgets. The coordinator's
+      // self-notice channel (consolidation/pruning/digest notices) is the only
+      // intentional self-target and stays permitted.
+      targets = targets.filter((t) => t !== sender.id || sender.role === "coordinator");
+
       const msgs = targets.map((toMemberId): SwarmMessage => {
         const expiresAt =
           input.priority === "urgent" ? now + 60_000 * 60 : undefined;
@@ -647,6 +718,34 @@ export class SwarmCore {
 
       return tx.insertMessages(msgs);
     }).then(async (msgs) => {
+      // Handoff ledger + event stream: a `handoff` message is a deliverable —
+      // auto-record it so the swarm (and other swarms) can query the durable
+      // deliverable bus (summary, refs, artifact paths). Every send lands in
+      // the timeline too. Best-effort: recording never fails the send.
+      try {
+        await this.store.insertEvent({
+          swarmId: swarm.id,
+          type: "message.sent",
+          actorMemberId: sender.id,
+          entityType: "message",
+          entityId: msgs[0]?.id,
+          payloadJson: JSON.stringify({ kind: input.kind, to: input.to, recipients: msgs.length }),
+          createdAt: now,
+        });
+        if (input.kind === "handoff") {
+          await this.store.insertDeliverable({
+            swarmId: swarm.id,
+            memberId: sender.id,
+            taskId: input.taskId,
+            summary: input.message,
+            refs: input.refs,
+            files: extractFileMentions(input.message),
+            createdAt: now,
+          });
+        }
+      } catch (err) {
+        console.warn(`[swarm] deliverable/event recording failed: ${(err as Error).message}`);
+      }
       // Auto-wake: deliver immediately to recipients (post-commit, so we
       // never hold a write lock across the external prompt). This is what makes
       // peer-to-peer messaging self-driving — no coordinator polling.
@@ -961,6 +1060,12 @@ export class SwarmCore {
     refs?: string[];
     /** Reply can itself be marked noreply (fire-and-forget follow-up). */
     noreply?: boolean;
+    /** Cross-swarm: allow replying to a message whose original sender lives in
+     * a different swarm than the caller (and allow the caller to pass the
+     * FOREIGN swarm id as `swarmId`). The reply always lands in the ORIGINAL
+     * SENDER's home swarm — the recipient's mailbox — so a cross-swarm thread
+     * ping-pongs between the two swarms symmetrically. */
+    force?: boolean;
   }): Promise<SwarmMessage[]> {
     const swarm = await this.store.getSwarm(input.swarmId);
     if (!swarm) throw new Error(`no such swarm '${input.swarmId}'`);
@@ -969,11 +1074,15 @@ export class SwarmCore {
       throw new Error("reply body cannot be empty");
     }
 
-    // Locate the original message and verify it belongs to this swarm.
+    // Locate the original message and verify it belongs to this swarm
+    // (cross-swarm replies with force may reference a foreign swarm's message).
     const original = await this.store.getMessageById(input.toMessageId);
     if (!original) throw new Error(`no message with id '${input.toMessageId}'`);
-    if (original.swarmId !== swarm.id) {
-      throw new Error(`message '${input.toMessageId}' belongs to a different swarm`);
+    if (!input.force && original.swarmId !== swarm.id) {
+      throw new Error(
+        `message '${input.toMessageId}' belongs to a different swarm — ` +
+          `pass force: true to reply across swarms (the reply still lands in the original sender's swarm)`,
+      );
     }
     const kind = input.kind ?? "response";
     assertNoreplyAllowed(kind, input.noreply);
@@ -989,13 +1098,23 @@ export class SwarmCore {
       );
     }
 
-    const sender = input.fromMemberId
-      ? await this.getMember(input.swarmId, input.fromMemberId)
-      : input.fromSessionId
-        ? await this.store.getMemberBySessionId(input.fromSessionId)
-        : undefined;
-    if (!sender || sender.swarmId !== swarm.id) {
-      throw new Error(`sender is not a member of swarm '${swarm.name}'`);
+    // Sender resolution: a member of `swarmId` normally; with force, any
+    // registered member (their id comes from the session mapping, so the
+    // identity is never spoofable).
+    let sender: SwarmMember | undefined;
+    if (input.fromMemberId) {
+      sender = input.force
+        ? await this.store.getMemberById(input.fromMemberId)
+        : await this.getMember(input.swarmId, input.fromMemberId);
+    } else if (input.fromSessionId) {
+      const bySession = await this.store.getMemberBySessionId(input.fromSessionId);
+      if (bySession && (input.force || bySession.swarmId === swarm.id)) sender = bySession;
+    }
+    if (!sender) {
+      throw new Error(
+        `sender is not a member of swarm '${swarm.name}' — ` +
+          `if the sender is a member of another swarm, pass force: true to reply across swarms`,
+      );
     }
     // A reply to your own message is pointless — it loops back to your own
     // inbox and burns a turn + cooldown. Hard block for every role.
@@ -1003,30 +1122,68 @@ export class SwarmCore {
       throw new Error("cannot reply to your own message — send a fresh message or publish to the blackboard instead");
     }
 
-    // The reply goes back to whoever sent the original message. The recipient
+    // The reply goes back to whoever sent the original message — in a
+    // cross-swarm thread that sender lives in ANOTHER swarm, so the recipient
+    // is resolved globally (never by the target swarm's roster). The recipient
     // must still be an active member — otherwise the reply would be zombie mail.
-    const recipient = await this.getMember(swarm.id, original.fromMemberId);
+    const recipient = await this.store.getMemberById(original.fromMemberId);
     if (!recipient) throw new Error(`original sender is no longer a member`);
     if (["stopped", "stopping", "failed"].includes(recipient.status)) {
       throw new Error(`cannot reply: original sender '${recipient.name}' is ${recipient.status}`);
     }
     const recipientId = original.fromMemberId;
-    const msg: SwarmMessage = {
-      id: makeId("msg"),
-      swarmId: swarm.id,
+    // The reply row lives in the RECIPIENT's HOME swarm (uniform rule: a
+    // message row lives where its recipient lives). For in-swarm threads that
+    // is the caller's swarm — identical to previous behavior; for cross-swarm
+    // threads it is the original sender's swarm, so their mailbox/broker
+    // deliver it normally.
+    //
+    // @mention auto-notify: mentioning members in the reply body ALSO delivers
+    // the reply to them (each gets their own row, in THEIR home swarm).
+    const callerSwarmMembers = await this.store.listMembers(swarm.id);
+    const mentioned = extractMemberMentions(input.message, callerSwarmMembers.map((m) => m.name));
+    const targetIds = new Set([recipientId]);
+    for (const m of callerSwarmMembers) {
+      if (!mentioned.includes(m.name)) continue;
+      if (m.id === sender.id) continue;
+      if (m.id === recipientId) continue;
+      if (["stopped", "stopping", "failed"].includes(m.status)) continue;
+      targetIds.add(m.id);
+    }
+    const homeByMember = new Map(callerSwarmMembers.map((m) => [m.id, m.swarmId]));
+    const base = {
+      id: "", // per-recipient below
+      swarmId: "", // per-recipient below
       fromMemberId: sender.id,
-      to: { type: "member", memberId: recipientId },
+      to: { type: "member" as const, memberId: "" },
       kind,
       correlationId: original.correlationId,
       responseTo: original.id,
       priority: input.priority ?? original.priority,
       body: { text: input.message, refs: input.refs },
-      deliveryState: "queued",
+      deliveryState: "queued" as const,
       attemptCount: 0,
       noreply: input.noreply,
       createdAt: Date.now(),
     };
-    const inserted = await this.store.insertMessages([msg]);
+    const msgs = [...targetIds].map((toMemberId): SwarmMessage => ({
+      ...base,
+      id: makeId("msg"),
+      swarmId: homeByMember.get(toMemberId) ?? recipient.swarmId,
+      to: { type: "member", memberId: toMemberId },
+    }));
+    const inserted = await this.store.insertMessages(msgs);
+    // Timeline: a reply is a first-class transition (message.replied) pointing
+    // at the ORIGINAL message id so replay threads are traceable. Best-effort —
+    // recording never fails the reply.
+    await recordEvent(this.store, {
+      swarmId: inserted[0]?.swarmId ?? swarm.id,
+      type: "message.replied",
+      actorMemberId: sender.id,
+      entityType: "message",
+      entityId: original.id,
+      payloadJson: JSON.stringify({ kind, to: recipient.name }),
+    });
     await this.autoWakeRecipients(inserted);
     return inserted;
   }
@@ -1080,6 +1237,34 @@ export class SwarmCore {
           currentVersion ?? 0,
         );
       }
+      // Typed blackboard contracts (t-contracts): if a contract governs this
+      // EXACT key, the value must be valid JSON AND satisfy the JSON-schema
+      // before the write lands. Writers get a clear, actionable error. Runs
+      // inside the same transaction as the write so a concurrent contract
+      // definition can never slip a non-conforming value through. Unsupported
+      // schema keywords pass through (treated as valid).
+      const contract = await tx.getContract(input.swarmId, input.key);
+      if (contract) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(input.value);
+        } catch {
+          throw new Error(`contract ${input.key} requires a JSON value`);
+        }
+        let schema: JsonSchema;
+        try {
+          schema = JSON.parse(contract.schemaJson) as JsonSchema;
+        } catch {
+          // A contract with an unparseable schema cannot validate anything —
+          // surface it as a violation so the coordinator notices the broken
+          // contract instead of silently skipping validation.
+          throw new Error(`contract violation on ${input.key}: contract schema is not valid JSON`);
+        }
+        const reasons = validateValueAgainstSchema(schema, parsed);
+        if (reasons.length > 0) {
+          throw new Error(`contract violation on ${input.key}: ${reasons.join("; ")}`);
+        }
+      }
       const version = (existing?.version ?? 0) + 1;
       const entry: BlackboardEntry = {
         id: existing?.id ?? makeId("bb"),
@@ -1099,6 +1284,21 @@ export class SwarmCore {
         await tx.upsertBlackboard(entry, input.expectedVersion);
       } else {
         await tx.insertBlackboard(entry);
+      }
+      // Changelog: EVERY successful write (insert or update) to a contracted
+      // key records a `blackboard.write` event. Readers query the history via
+      // listEventsForEntity(swarmId, "blackboard", key). Atomic with the write
+      // so a changelog entry can never exist without its value (or vice versa).
+      if (contract) {
+        await tx.insertEvent({
+          swarmId: input.swarmId,
+          type: "blackboard.write",
+          actorMemberId: input.authorMemberId,
+          entityType: "blackboard",
+          entityId: input.key,
+          payloadJson: JSON.stringify({ version, authorMemberId: input.authorMemberId }),
+          createdAt: now,
+        });
       }
       return entry;
     });
@@ -1185,6 +1385,15 @@ export class SwarmCore {
     const done = status === "completed" || status === "failed" || status === "cancelled";
     if (!done && task && (status === "working" || status === "claimed")) {
       await this.store.updateTaskStatus(taskId, "completed");
+      // Timeline: terminal task transition (task.completed). Best-effort.
+      await recordEvent(this.store, {
+        swarmId: swarm.id,
+        type: "task.completed",
+        actorMemberId: member.id,
+        entityType: "task",
+        entityId: taskId,
+        payloadJson: JSON.stringify({ memberId: member.id }),
+      });
     }
     // Clear the member's current task so a later idle event won't re-notify.
     await this.store.updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: Date.now() });

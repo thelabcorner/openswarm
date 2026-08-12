@@ -5,8 +5,12 @@ import type {
   Belief,
   BeliefStatus,
   BlackboardEntry,
+  ContractDefinition,
+  Deliverable,
   PathClaim,
+  PendingPermission,
   Swarm,
+  SwarmEvent,
   SwarmMember,
   SwarmMessage,
   SwarmTask,
@@ -16,9 +20,12 @@ import type {
   NewArtifactAnnotation,
   NewBelief,
   NewBlackboardEntry,
+  NewContractDefinition,
+  NewDeliverable,
   NewMessage,
   NewPathClaim,
   NewSwarm,
+  NewSwarmEvent,
   NewSwarmMember,
   NewTask,
   TaskDependency,
@@ -273,6 +280,65 @@ CREATE TABLE IF NOT EXISTS swarm_subscription (
 );
 CREATE INDEX IF NOT EXISTS idx_subscription_swarm ON swarm_subscription(swarm_id);
 
+-- Pending permission prompts: a member's permission.ask that stayed "ask"
+-- (not auto-allowed). The coordinator reviews and answers these via
+-- swarm_permissions (reply once/always/reject) so headless members never
+-- stall on an unanswered prompt. response: null while pending, else the
+-- answer (once/always/reject — or the raw string from the permission.replied
+-- event when the user answered in the app).
+CREATE TABLE IF NOT EXISTS swarm_pending_permission (
+  id TEXT PRIMARY KEY,
+  swarm_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  pattern TEXT,
+  title TEXT,
+  response TEXT,
+  responded_at INTEGER,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+  FOREIGN KEY(member_id) REFERENCES swarm_member(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_pending_perm_swarm
+  ON swarm_pending_permission(swarm_id, response);
+
+-- Handoff ledger: one row per recorded handoff message (the deliverable bus).
+-- verdict: null while open, else accepted | rejected (coordinator).
+CREATE TABLE IF NOT EXISTS swarm_deliverable (
+  id TEXT PRIMARY KEY,
+  swarm_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  task_id TEXT,
+  summary TEXT NOT NULL,
+  refs_json TEXT,
+  files_json TEXT,
+  verdict TEXT,
+  verdict_by TEXT,
+  verdict_at INTEGER,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+  FOREIGN KEY(member_id) REFERENCES swarm_member(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_deliverable_swarm
+  ON swarm_deliverable(swarm_id, verdict, created_at DESC);
+
+-- Typed blackboard contracts: JSON-schema per key; writes to a contracted key
+-- are validated before they land (writers get validation errors).
+CREATE TABLE IF NOT EXISTS swarm_contract (
+  id TEXT PRIMARY KEY,
+  swarm_id TEXT NOT NULL,
+  key_pattern TEXT NOT NULL,
+  schema_json TEXT NOT NULL,
+  description TEXT,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+  UNIQUE(swarm_id, key_pattern)
+);
+CREATE INDEX IF NOT EXISTS idx_contract_swarm ON swarm_contract(swarm_id);
+
 CREATE TABLE IF NOT EXISTS swarm_event (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   swarm_id TEXT NOT NULL,
@@ -335,6 +401,68 @@ interface RowBelief {
   confidence: number; tags: string | null; tier: string; ttl: number | null; expires_at: number | null;
   author_member_id: string; evidence_refs: string | null; reinforce_count: number;
   status: string; resonant_at: number | null; created_at: number; updated_at: number;
+}
+
+interface RowPendingPermission {
+  id: string; swarm_id: string; member_id: string; session_id: string;
+  type: string; pattern: string | null; title: string | null;
+  response: string | null; responded_at: number | null; created_at: number;
+}
+
+function toPendingPermission(r: RowPendingPermission): PendingPermission {
+  return {
+    id: r.id, swarmId: r.swarm_id, memberId: r.member_id, sessionId: r.session_id,
+    type: r.type, pattern: r.pattern ?? undefined, title: r.title ?? undefined,
+    response: r.response, respondedAt: r.responded_at, createdAt: r.created_at,
+  };
+}
+
+interface RowEvent {
+  id: number; swarm_id: string; type: string; actor_member_id: string | null;
+  entity_type: string | null; entity_id: string | null; payload_json: string | null;
+  created_at: number;
+}
+
+function toEvent(r: RowEvent): SwarmEvent {
+  return {
+    id: r.id, swarmId: r.swarm_id, type: r.type,
+    actorMemberId: r.actor_member_id ?? undefined,
+    entityType: r.entity_type ?? undefined,
+    entityId: r.entity_id ?? undefined,
+    payloadJson: r.payload_json ?? undefined,
+    createdAt: r.created_at,
+  };
+}
+
+interface RowDeliverable {
+  id: string; swarm_id: string; member_id: string; task_id: string | null;
+  summary: string; refs_json: string | null; files_json: string | null;
+  verdict: string | null; verdict_by: string | null; verdict_at: number | null;
+  created_at: number;
+}
+
+function toDeliverable(r: RowDeliverable): Deliverable {
+  return {
+    id: r.id, swarmId: r.swarm_id, memberId: r.member_id,
+    taskId: r.task_id ?? undefined, summary: r.summary,
+    refs: r.refs_json ? JSON.parse(r.refs_json) : undefined,
+    files: r.files_json ? JSON.parse(r.files_json) : undefined,
+    verdict: r.verdict, verdictBy: r.verdict_by ?? undefined,
+    verdictAt: r.verdict_at ?? undefined, createdAt: r.created_at,
+  };
+}
+
+interface RowContract {
+  id: string; swarm_id: string; key_pattern: string; schema_json: string;
+  description: string | null; created_by: string; created_at: number; updated_at: number;
+}
+
+function toContract(r: RowContract): ContractDefinition {
+  return {
+    id: r.id, swarmId: r.swarm_id, keyPattern: r.key_pattern,
+    schemaJson: r.schema_json, description: r.description ?? undefined,
+    createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+  };
 }
 
 interface RowSwarm {
@@ -634,6 +762,68 @@ export class SQLiteStore implements SwarmStore {
         addColumn(db, "swarm_task", "reserved_at", "INTEGER");
       },
     },
+    {
+      version: 10,
+      label: "create swarm_pending_permission (coordinator answers member stalls)",
+      up: (db) => {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS swarm_pending_permission (
+            id TEXT PRIMARY KEY,
+            swarm_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            pattern TEXT,
+            title TEXT,
+            response TEXT,
+            responded_at INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+            FOREIGN KEY(member_id) REFERENCES swarm_member(id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_pending_perm_swarm
+            ON swarm_pending_permission(swarm_id, response);
+        `);
+      },
+    },
+    {
+      version: 11,
+      label: "create swarm_deliverable + swarm_contract (ledger + typed contracts)",
+      up: (db) => {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS swarm_deliverable (
+            id TEXT PRIMARY KEY,
+            swarm_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            task_id TEXT,
+            summary TEXT NOT NULL,
+            refs_json TEXT,
+            files_json TEXT,
+            verdict TEXT,
+            verdict_by TEXT,
+            verdict_at INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+            FOREIGN KEY(member_id) REFERENCES swarm_member(id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_deliverable_swarm
+            ON swarm_deliverable(swarm_id, verdict, created_at DESC);
+          CREATE TABLE IF NOT EXISTS swarm_contract (
+            id TEXT PRIMARY KEY,
+            swarm_id TEXT NOT NULL,
+            key_pattern TEXT NOT NULL,
+            schema_json TEXT NOT NULL,
+            description TEXT,
+            created_by TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+            UNIQUE(swarm_id, key_pattern)
+          );
+          CREATE INDEX IF NOT EXISTS idx_contract_swarm ON swarm_contract(swarm_id);
+        `);
+      },
+    },
   ];
 
   private runMigrations(): void {
@@ -716,6 +906,7 @@ export class SQLiteStore implements SwarmStore {
   deleteSwarm(swarmId: string): Promise<void> { return this.serialized(() => this.tx.deleteSwarm(swarmId)); }
   updateSwarmDirectory(swarmId: string, directory: string): Promise<void> { return this.serialized(() => this.tx.updateSwarmDirectory(swarmId, directory)); }
   updateSwarmCoordinator(swarmId: string, coordinatorSessionId: string): Promise<void> { return this.serialized(() => this.tx.updateSwarmCoordinator(swarmId, coordinatorSessionId)); }
+  updateSwarmStatus(swarmId: string, status: Swarm["status"]): Promise<void> { return this.serialized(() => this.tx.updateSwarmStatus(swarmId, status)); }
   assignMemberSession(memberId: string, sessionId: string): Promise<void> { return this.serialized(() => this.tx.assignMemberSession(memberId, sessionId)); }
   getSwarm(id: string): Promise<Swarm | undefined> { return this.serialized(() => this.tx.getSwarm(id)); }
   getSwarmBySession(sessionID: string): Promise<Swarm | undefined> { return this.serialized(() => this.tx.getSwarmBySession(sessionID)); }
@@ -744,6 +935,7 @@ export class SQLiteStore implements SwarmStore {
   listExpiredLeaseTasks(swarmId: string, now: number): Promise<SwarmTask[]> { return this.serialized(() => this.tx.listExpiredLeaseTasks(swarmId, now)); }
   getBlackboard(swarmId: string, key: string): Promise<BlackboardEntry | undefined> { return this.serialized(() => this.tx.getBlackboard(swarmId, key)); }
   searchBlackboard(swarmId: string, query: string): Promise<BlackboardEntry[]> { return this.serialized(() => this.tx.searchBlackboard(swarmId, query)); }
+  listBlackboardEntries(swarmId: string): Promise<BlackboardEntry[]> { return this.serialized(() => this.tx.listBlackboardEntries(swarmId)); }
   upsertBlackboard(entry: BlackboardEntry, expectedVersion?: number): Promise<void> { return this.serialized(() => this.tx.upsertBlackboard(entry, expectedVersion)); }
   listPendingMessages(toMemberId: string): Promise<NewMessage[]> { return this.serialized(() => this.tx.listPendingMessages(toMemberId)); }
   listMembersWithPendingMail(): Promise<Array<{ memberId: string; sessionId: string; count: number }>> { return this.serialized(() => this.tx.listMembersWithPendingMail()); }
@@ -807,6 +999,35 @@ export class SQLiteStore implements SwarmStore {
   hardPruneBeliefs(swarmId: string, factHashes: string[]): Promise<number> { return this.serialized(() => this.tx.hardPruneBeliefs(swarmId, factHashes)); }
   beliefDigest(swarmId: string): Promise<{ digest: string; count: number }> { return this.serialized(() => this.tx.beliefDigest(swarmId)); }
   listBeliefsChangedSince(swarmId: string, since: number): Promise<Belief[]> { return this.serialized(() => this.tx.listBeliefsChangedSince(swarmId, since)); }
+
+  // ==== Pending permission prompts (coordinator answers member stalls) ====
+
+  insertPendingPermission(p: PendingPermission): Promise<void> { return this.serialized(() => this.tx.insertPendingPermission(p)); }
+  listPendingPermissions(swarmId: string): Promise<PendingPermission[]> { return this.serialized(() => this.tx.listPendingPermissions(swarmId)); }
+  listPendingForMembers(memberIds: string[]): Promise<PendingPermission[]> { return this.serialized(() => this.tx.listPendingForMembers(memberIds)); }
+  getPendingPermission(swarmId: string, permissionId: string): Promise<PendingPermission | undefined> { return this.serialized(() => this.tx.getPendingPermission(swarmId, permissionId)); }
+  respondToPermission(permissionId: string, response: "once" | "always" | "reject"): Promise<void> { return this.serialized(() => this.tx.respondToPermission(permissionId, response)); }
+  markPermissionReplied(permissionId: string, response?: string): Promise<void> { return this.serialized(() => this.tx.markPermissionReplied(permissionId, response)); }
+
+  // ==== Event stream (timeline / replay) ====
+
+  insertEvent(e: NewSwarmEvent): Promise<void> { return this.serialized(() => this.tx.insertEvent(e)); }
+  listEvents(swarmId: string, opts?: { limit?: number; since?: number }): Promise<SwarmEvent[]> { return this.serialized(() => this.tx.listEvents(swarmId, opts)); }
+  listEventsForEntity(swarmId: string, entityType: string, entityId: string, opts?: { limit?: number }): Promise<SwarmEvent[]> { return this.serialized(() => this.tx.listEventsForEntity(swarmId, entityType, entityId, opts)); }
+
+  // ==== Handoff ledger (deliverables) ====
+
+  insertDeliverable(d: NewDeliverable): Promise<Deliverable> { return this.serialized(() => this.tx.insertDeliverable(d)); }
+  listDeliverables(swarmId: string, opts?: { verdict?: "accepted" | "rejected"; memberId?: string; taskId?: string; limit?: number }): Promise<Deliverable[]> { return this.serialized(() => this.tx.listDeliverables(swarmId, opts)); }
+  setDeliverableVerdict(deliverableId: string, verdict: "accepted" | "rejected", byMemberId: string): Promise<boolean> { return this.serialized(() => this.tx.setDeliverableVerdict(deliverableId, verdict, byMemberId)); }
+  getDeliverable(deliverableId: string): Promise<Deliverable | undefined> { return this.serialized(() => this.tx.getDeliverable(deliverableId)); }
+
+  // ==== Typed blackboard contracts ====
+
+  insertContract(c: NewContractDefinition): Promise<ContractDefinition> { return this.serialized(() => this.tx.insertContract(c)); }
+  listContracts(swarmId: string): Promise<ContractDefinition[]> { return this.serialized(() => this.tx.listContracts(swarmId)); }
+  getContract(swarmId: string, key: string): Promise<ContractDefinition | undefined> { return this.serialized(() => this.tx.getContract(swarmId, key)); }
+  deleteContract(swarmId: string, key: string): Promise<boolean> { return this.serialized(() => this.tx.deleteContract(swarmId, key)); }
 }
 
 class Tx implements SwarmStoreTx {
@@ -925,6 +1146,13 @@ class Tx implements SwarmStoreTx {
     this.db.run(
       `UPDATE swarm SET coordinator_session_id = ?, updated_at = ? WHERE id = ?`,
       [coordinatorSessionId, Date.now(), swarmId],
+    );
+  }
+
+  async updateSwarmStatus(swarmId: string, status: Swarm["status"]): Promise<void> {
+    this.db.run(
+      `UPDATE swarm SET status = ?, updated_at = ? WHERE id = ?`,
+      [status, Date.now(), swarmId],
     );
   }
 
@@ -1143,6 +1371,191 @@ class Tx implements SwarmStoreTx {
     const res = this.db.run(
       `DELETE FROM swarm_artifact_annotation WHERE id = ?`,
       [annotationId],
+    );
+    return res.changes > 0;
+  }
+
+  // ==== Pending permission prompts (coordinator answers member stalls) ====
+
+  async insertPendingPermission(p: PendingPermission): Promise<void> {
+    this.db.run(
+      `INSERT OR REPLACE INTO swarm_pending_permission
+         (id, swarm_id, member_id, session_id, type, pattern, title, response, responded_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [p.id, p.swarmId, p.memberId, p.sessionId, p.type, p.pattern ?? null, p.title ?? null, p.response, p.respondedAt, p.createdAt],
+    );
+  }
+
+  async listPendingPermissions(swarmId: string): Promise<PendingPermission[]> {
+    const rows = this.db.query<RowPendingPermission, [string]>(
+      `SELECT * FROM swarm_pending_permission
+       WHERE swarm_id = ? AND response IS NULL
+       ORDER BY created_at DESC`,
+    ).all(swarmId);
+    return rows.map(toPendingPermission);
+  }
+
+  async listPendingForMembers(memberIds: string[]): Promise<PendingPermission[]> {
+    if (memberIds.length === 0) return [];
+    const placeholders = memberIds.map(() => "?").join(", ");
+    const rows = this.db.query<RowPendingPermission, string[]>(
+      `SELECT * FROM swarm_pending_permission
+       WHERE member_id IN (${placeholders}) AND response IS NULL
+       ORDER BY created_at DESC`,
+    ).all(...memberIds);
+    return rows.map(toPendingPermission);
+  }
+
+  async getPendingPermission(swarmId: string, permissionId: string): Promise<PendingPermission | undefined> {
+    const row = this.db.query<RowPendingPermission, [string, string]>(
+      `SELECT * FROM swarm_pending_permission WHERE swarm_id = ? AND id = ?`,
+    ).get(swarmId, permissionId);
+    return row ? toPendingPermission(row) : undefined;
+  }
+
+  async respondToPermission(permissionId: string, response: "once" | "always" | "reject"): Promise<void> {
+    this.db.run(
+      `UPDATE swarm_pending_permission SET response = ?, responded_at = ? WHERE id = ? AND response IS NULL`,
+      [response, Date.now(), permissionId],
+    );
+  }
+
+  async markPermissionReplied(permissionId: string, response?: string): Promise<void> {
+    this.db.run(
+      `UPDATE swarm_pending_permission SET response = ?, responded_at = ? WHERE id = ?`,
+      [response ?? "replied", Date.now(), permissionId],
+    );
+  }
+
+  // ==== Event stream (timeline / replay) ====
+
+  async insertEvent(e: NewSwarmEvent): Promise<void> {
+    this.db.run(
+      `INSERT INTO swarm_event (swarm_id, type, actor_member_id, entity_type, entity_id, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [e.swarmId, e.type, e.actorMemberId ?? null, e.entityType ?? null, e.entityId ?? null, e.payloadJson ?? null, e.createdAt],
+    );
+  }
+
+  async listEvents(swarmId: string, opts?: { limit?: number; since?: number }): Promise<SwarmEvent[]> {
+    const limit = opts?.limit ?? 100;
+    const rows =
+      opts?.since !== undefined
+        ? this.db.query<RowEvent, [string, number, number]>(
+            `SELECT * FROM swarm_event WHERE swarm_id = ? AND created_at > ? ORDER BY id DESC LIMIT ?`,
+          ).all(swarmId, opts.since, limit)
+        : this.db.query<RowEvent, [string, number]>(
+            `SELECT * FROM swarm_event WHERE swarm_id = ? ORDER BY id DESC LIMIT ?`,
+          ).all(swarmId, limit);
+    return rows.map(toEvent);
+  }
+
+  async listEventsForEntity(swarmId: string, entityType: string, entityId: string, opts?: { limit?: number }): Promise<SwarmEvent[]> {
+    const rows = this.db.query<RowEvent, [string, string, string, number]>(
+      `SELECT * FROM swarm_event
+       WHERE swarm_id = ? AND entity_type = ? AND entity_id = ?
+       ORDER BY id DESC LIMIT ?`,
+    ).all(swarmId, entityType, entityId, opts?.limit ?? 50);
+    return rows.map(toEvent);
+  }
+
+  // ==== Handoff ledger (deliverables) ====
+
+  async insertDeliverable(d: NewDeliverable): Promise<Deliverable> {
+    const id = d.id ?? `dlv_${crypto.randomUUID().replace(/-/g, "")}`;
+    const now = d.createdAt;
+    this.db.run(
+      `INSERT INTO swarm_deliverable (id, swarm_id, member_id, task_id, summary, refs_json, files_json, verdict, verdict_by, verdict_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, d.swarmId, d.memberId, d.taskId ?? null, d.summary,
+        d.refs?.length ? JSON.stringify(d.refs) : null,
+        d.files?.length ? JSON.stringify(d.files) : null,
+        d.verdict ?? null, null, null, now,
+      ],
+    );
+    return {
+      id, swarmId: d.swarmId, memberId: d.memberId, taskId: d.taskId,
+      summary: d.summary, refs: d.refs, files: d.files,
+      verdict: d.verdict ?? null, createdAt: now,
+    };
+  }
+
+  async listDeliverables(
+    swarmId: string,
+    opts?: { verdict?: "accepted" | "rejected"; memberId?: string; taskId?: string; limit?: number },
+  ): Promise<Deliverable[]> {
+    const conditions = ["swarm_id = ?"];
+    const params: unknown[] = [swarmId];
+    if (opts?.verdict !== undefined) {
+      conditions.push(`verdict = ?`);
+      params.push(opts.verdict);
+    }
+    if (opts?.memberId !== undefined) {
+      conditions.push(`member_id = ?`);
+      params.push(opts.memberId);
+    }
+    if (opts?.taskId !== undefined) {
+      conditions.push(`task_id = ?`);
+      params.push(opts.taskId);
+    }
+    const rows = this.db.query<RowDeliverable, unknown[]>(
+      `SELECT * FROM swarm_deliverable
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY created_at DESC LIMIT ?`,
+    ).all(...params, opts?.limit ?? 50);
+    return rows.map(toDeliverable);
+  }
+
+  async setDeliverableVerdict(deliverableId: string, verdict: "accepted" | "rejected", byMemberId: string): Promise<boolean> {
+    const res = this.db.run(
+      `UPDATE swarm_deliverable SET verdict = ?, verdict_by = ?, verdict_at = ? WHERE id = ? AND verdict IS NULL`,
+      [verdict, byMemberId, Date.now(), deliverableId],
+    );
+    return res.changes > 0;
+  }
+
+  async getDeliverable(deliverableId: string): Promise<Deliverable | undefined> {
+    const row = this.db.query<RowDeliverable, [string]>(
+      `SELECT * FROM swarm_deliverable WHERE id = ?`,
+    ).get(deliverableId);
+    return row ? toDeliverable(row) : undefined;
+  }
+
+  // ==== Typed blackboard contracts ====
+
+  async insertContract(c: NewContractDefinition): Promise<ContractDefinition> {
+    const id = c.id ?? `ctr_${crypto.randomUUID().replace(/-/g, "")}`;
+    const now = Date.now();
+    this.db.run(
+      `INSERT OR REPLACE INTO swarm_contract (id, swarm_id, key_pattern, schema_json, description, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, c.swarmId, c.keyPattern, c.schemaJson, c.description ?? null, c.createdBy, now, now],
+    );
+    return {
+      id, swarmId: c.swarmId, keyPattern: c.keyPattern, schemaJson: c.schemaJson,
+      description: c.description, createdBy: c.createdBy, createdAt: now, updatedAt: now,
+    };
+  }
+
+  async listContracts(swarmId: string): Promise<ContractDefinition[]> {
+    const rows = this.db.query<RowContract, [string]>(
+      `SELECT * FROM swarm_contract WHERE swarm_id = ? ORDER BY key_pattern`,
+    ).all(swarmId);
+    return rows.map(toContract);
+  }
+
+  async getContract(swarmId: string, key: string): Promise<ContractDefinition | undefined> {
+    const row = this.db.query<RowContract, [string, string]>(
+      `SELECT * FROM swarm_contract WHERE swarm_id = ? AND key_pattern = ?`,
+    ).get(swarmId, key);
+    return row ? toContract(row) : undefined;
+  }
+
+  async deleteContract(swarmId: string, key: string): Promise<boolean> {
+    const res = this.db.run(
+      `DELETE FROM swarm_contract WHERE swarm_id = ? AND key_pattern = ?`,
+      [swarmId, key],
     );
     return res.changes > 0;
   }
@@ -1603,6 +2016,13 @@ class Tx implements SwarmStoreTx {
     const rows = this.db.query<RowBlackboard, [string, string, string]>(
       `SELECT * FROM swarm_blackboard WHERE swarm_id = ? AND (lower(key) LIKE ? ESCAPE '\\' OR lower(value) LIKE ? ESCAPE '\\')`,
     ).all(swarmId, like, like);
+    return rows.map(toBlackboard);
+  }
+
+  async listBlackboardEntries(swarmId: string): Promise<BlackboardEntry[]> {
+    const rows = this.db.query<RowBlackboard, [string]>(
+      `SELECT * FROM swarm_blackboard WHERE swarm_id = ? ORDER BY key`,
+    ).all(swarmId);
     return rows.map(toBlackboard);
   }
 

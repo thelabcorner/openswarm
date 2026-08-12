@@ -185,7 +185,7 @@ async function setup2() {
 describe("envelope + broker prompt", () => {
   test("formatEnvelope renders the noreply marker", () => {
     const env = formatEnvelope(fakeMessage({ noreply: true }), new Map([["m-a", "A"]]));
-    expect(env).toContain("[noreply — no response expected");
+    expect(env).toContain("[noreply]");
   });
 
   test("formatEnvelope omits the marker when not noreply", () => {
@@ -222,7 +222,7 @@ describe("envelope + broker prompt", () => {
     ]);
     await broker.deliverToIdleMember("m-a", "sess-a");
     expect(prompts.length).toBe(1);
-    expect(prompts[0]).toContain("None of these messages expect a reply");
+    expect(prompts[0]).toContain("[no replies needed");
     expect(prompts[0]).toContain("do not respond unless you can act or escalate");
   });
 
@@ -233,7 +233,7 @@ describe("envelope + broker prompt", () => {
       fakeMessage({ swarmId: "s", fromMemberId: "m-a", to: { type: "member", memberId: "m-a" }, noreply: false }),
     ]);
     await broker.deliverToIdleMember("m-a", "sess-a");
-    expect(prompts[0]).toContain("Reply to senders with swarm_message");
-    expect(prompts[0]).not.toContain("None of these messages expect a reply");
+    expect(prompts[0]).toContain("[reply where needed");
+    expect(prompts[0]).not.toContain("[no replies needed");
   });
 });

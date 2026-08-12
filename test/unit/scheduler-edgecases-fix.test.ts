@@ -2,7 +2,7 @@ import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { swarmPlugin, swarmRuntime } from "../../src/plugin.ts";
+import { swarmPlugin, swarmRuntime, disposeSwarmRuntime } from "../../src/plugin.ts";
 import type { Hooks } from "@opencode-ai/plugin";
 import type { SwarmPluginRuntime } from "../../src/plugin.ts";
 
@@ -70,6 +70,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+disposeSwarmRuntime();
   // Reset the process-global plugin singleton so sibling test files are not
   // affected (mirror digest-exchange cleanup).
   await (hooks as any).dispose?.();

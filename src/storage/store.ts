@@ -3,16 +3,23 @@ import type {
   Belief,
   BeliefStatus,
   BlackboardEntry,
+  ContractDefinition,
+  Deliverable,
   NewArtifactAnnotation,
   NewBelief,
   NewBlackboardEntry,
+  NewContractDefinition,
+  NewDeliverable,
   NewMessage,
   NewPathClaim,
   NewSwarm,
+  NewSwarmEvent,
   NewSwarmMember,
   NewTask,
   PathClaim,
+  PendingPermission,
   Swarm,
+  SwarmEvent,
   SwarmMember,
   SwarmMessage,
   SwarmTask,
@@ -44,6 +51,9 @@ export interface SwarmStoreTx {
   /** Rebind a swarm to a new coordinator session (used when a swarm is reused
    * from a different chat/session so the caller becomes the coordinator). */
   updateSwarmCoordinator(swarmId: string, coordinatorSessionId: string): Promise<void>;
+  /** Set a swarm's lifecycle status (used by revive to flip a completed/failed
+   * swarm back to active, and by normal lifecycle transitions). */
+  updateSwarmStatus(swarmId: string, status: Swarm["status"]): Promise<void>;
   listMembers(swarmId: string): Promise<SwarmMember[]>;
   getMemberById(memberId: string): Promise<SwarmMember | undefined>;
   getMemberBySessionId(sessionID: string): Promise<SwarmMember | undefined>;
@@ -128,6 +138,10 @@ export interface SwarmStoreTx {
 
   getBlackboard(swarmId: string, key: string): Promise<BlackboardEntry | undefined>;
   searchBlackboard(swarmId: string, query: string): Promise<BlackboardEntry[]>;
+  /** Every blackboard entry for a swarm, ordered by key — used by the
+   * sqlite→chunkdb migration to copy the full blackboard through the public
+   * read API. */
+  listBlackboardEntries(swarmId: string): Promise<BlackboardEntry[]>;
   /**
    * Insert or update a blackboard row. When `expectedVersion` is provided, the
    * update is CAS-guarded at the store level: it only applies if the existing
@@ -259,6 +273,61 @@ export interface SwarmStoreTx {
   /** Anti-entropy pull: beliefs whose updated_at > since (changed since the
    * peer's last digest timestamp). */
   listBeliefsChangedSince(swarmId: string, since: number): Promise<Belief[]>;
+
+  // ==== Pending permission prompts (coordinator answers member stalls) ====
+
+  /** Record a permission prompt that stayed "ask" for a member session.
+   * Overwrites an existing row with the same id (the ask id is unique per
+   * request; re-raises just refresh the row). */
+  insertPendingPermission(p: PendingPermission): Promise<void>;
+  /** Pending (unanswered) permission prompts for a swarm, newest first. */
+  listPendingPermissions(swarmId: string): Promise<PendingPermission[]>;
+  /** Pending (unanswered) prompts for SPECIFIC member ids (cross-swarm safe:
+   * ids are global). Used to detect "recipient is stuck behind a permissions
+   * wall" at message-send time. */
+  listPendingForMembers(memberIds: string[]): Promise<PendingPermission[]>;
+  /** One record for a swarm (undefined when absent). */
+  getPendingPermission(swarmId: string, permissionId: string): Promise<PendingPermission | undefined>;
+  /** Mark a prompt answered by the coordinator (once/always/reject). */
+  respondToPermission(permissionId: string, response: "once" | "always" | "reject"): Promise<void>;
+  /** Mark a prompt answered externally (the `permission.replied` event — the
+   * user answered in the app). `response` may be a raw server string. */
+  markPermissionReplied(permissionId: string, response?: string): Promise<void>;
+
+  // ==== Event stream (timeline / replay) ====
+
+  /** Append one event to the swarm's timeline (fire-and-forget recording). */
+  insertEvent(e: NewSwarmEvent): Promise<void>;
+  /** Read the timeline newest-first; `opts.limit` (default 100) caps rows and
+   * `opts.since` filters to events after a timestamp. */
+  listEvents(swarmId: string, opts?: { limit?: number; since?: number }): Promise<SwarmEvent[]>;
+  /** Read events for one entity (e.g. changelog for a blackboard key). */
+  listEventsForEntity(swarmId: string, entityType: string, entityId: string, opts?: { limit?: number }): Promise<SwarmEvent[]>;
+
+  // ==== Handoff ledger (deliverables) ====
+
+  insertDeliverable(d: NewDeliverable): Promise<Deliverable>;
+  /** Deliverables newest-first; filters optional. */
+  listDeliverables(
+    swarmId: string,
+    opts?: { verdict?: "accepted" | "rejected"; memberId?: string; taskId?: string; limit?: number },
+  ): Promise<Deliverable[]>;
+  /** Attach a verdict (accepted/rejected) to an open deliverable. Returns
+   * false when the id is unknown or already verdict-ed. */
+  setDeliverableVerdict(deliverableId: string, verdict: "accepted" | "rejected", byMemberId: string): Promise<boolean>;
+  /** One ledger row by id (undefined when absent). Used by the verdict path to
+   * verify the deliverable belongs to the calling coordinator's swarm before
+   * recording a verdict on it. */
+  getDeliverable(deliverableId: string): Promise<Deliverable | undefined>;
+
+  // ==== Typed blackboard contracts ====
+
+  insertContract(c: NewContractDefinition): Promise<ContractDefinition>;
+  /** All contracts for a swarm. */
+  listContracts(swarmId: string): Promise<ContractDefinition[]>;
+  /** The contract governing a blackboard key (exact match). */
+  getContract(swarmId: string, key: string): Promise<ContractDefinition | undefined>;
+  deleteContract(swarmId: string, key: string): Promise<boolean>;
 }
 
 export interface SwarmStore extends SwarmStoreTx {

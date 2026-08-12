@@ -677,11 +677,12 @@ describe("SQLiteStore", () => {
 
       const reopened = new SQLiteStore(join(dir3, "old.db"));
       await reopened.ready();
-      // user_version reached the latest migration (9: task reserved_for;
-      // 8 = message.noreply; 7 = resonant_at, Hive H2; 6 = beliefs,
-      // 5 = annotations, 4 = lease columns, 3 = expires_at).
+      // user_version reached the latest migration (11: deliverables+contracts;
+      // 10: pending permissions; 9: task reserved_for; 8 = message.noreply;
+      // 7 = resonant_at, Hive H2; 6 = beliefs, 5 = annotations, 4 = lease
+      // columns, 3 = expires_at).
       const uv = await (reopened as any).db.query(`PRAGMA user_version`).get();
-      expect((uv as { user_version: number } | undefined)?.user_version).toBe(9);
+      expect((uv as { user_version: number } | undefined)?.user_version).toBe(11);
       // Columns present + usable.
       await reopened.insertSwarm(newSwarm("uv"));
       const swarm = await reopened.getSwarm("swarm-uv");

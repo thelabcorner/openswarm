@@ -3,8 +3,12 @@ import type {
   Belief,
   BeliefStatus,
   BlackboardEntry,
+  ContractDefinition,
+  Deliverable,
   PathClaim,
+  PendingPermission,
   Swarm,
+  SwarmEvent,
   SwarmMember,
   SwarmMessage,
   SwarmPolicies,
@@ -18,8 +22,12 @@ export type {
   Belief,
   BeliefStatus,
   BlackboardEntry,
+  ContractDefinition,
+  Deliverable,
   PathClaim,
+  PendingPermission,
   Swarm,
+  SwarmEvent,
   SwarmMember,
   SwarmMessage,
   SwarmPolicies,
@@ -47,6 +55,28 @@ export type NewTask = Omit<SwarmTask, "createdAt" | "updatedAt"> & {
 
 export type NewMessage = Omit<SwarmMessage, "createdAt"> & {
   createdAt: number;
+};
+
+export type NewSwarmEvent = Omit<SwarmEvent, "id"> & {
+  createdAt: number;
+};
+
+export type NewDeliverable = Omit<
+  Deliverable,
+  "id" | "verdict" | "verdictBy" | "verdictAt" | "createdAt"
+> & {
+  id?: string;
+  verdict?: string | null;
+  createdAt: number;
+};
+
+export type NewContractDefinition = Omit<
+  ContractDefinition,
+  "id" | "createdAt" | "updatedAt"
+> & {
+  id?: string;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type NewBlackboardEntry = Omit<

@@ -55,8 +55,8 @@ message or one of its own injections:
 - **Self-injection registry:** when the plugin injects a prompt it records the
   message id; a matching id is treated as self.
 - **Prefix fallback:** if the SDK does not echo the id, known prefix strings
-  (`[SWARM INBOX —`, `[TEAM SYNC —`, `[WATCHDOG]`, `You are \``, `[ASSIGNED TASK`,
-  etc.) classify the message as self.
+  (`[NEW MESSAGE FROM:`, `[NEW MESSAGES (`, `[TEAM SYNC —`, `[WATCHDOG]`,
+  `You are \``, `[ASSIGNED TASK`, etc.) classify the message as self.
 
 Anything that matches neither is a **human message** and starts/extends the
 member's chat state. The coordinator's own session is exempt.

@@ -1,0 +1,11 @@
+{
+  "name": "chunkdb-bun-prototype",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "bench": "bun run bench/benchmark.ts",
+    "demo": "bun run examples/demo.ts"
+  }
+}

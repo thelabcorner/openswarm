@@ -104,6 +104,10 @@ export interface AgentRuntime {
   /** Fetch a session's todo list (per-session todolist tool state). Lets members
    * read each other's in-progress items to avoid redundant work. */
   getSessionTodos?(sessionID: string): Promise<Array<{ content: string; status: string; priority: string }>>;
+  /** Answer a pending permission prompt for a session (the coordinator replying
+   * to a member's stall). Returns false when the prompt is already gone
+   * (answered/expired) or the runtime cannot reach it. */
+  replyPermission?(sessionID: string, permissionID: string, response: "once" | "always" | "reject"): Promise<boolean>;
 }
 
 /** The permission ruleset for an agent (mirrors AgentPermissions in

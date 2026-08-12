@@ -149,6 +149,76 @@ export interface SwarmMember {
   lastActiveAt?: number;
 }
 
+/**
+ * A permission prompt a member session raised that stayed "ask" (not
+ * auto-allowed) — the stall cause. Recorded so the coordinator can review and
+ * answer it (swarm_permissions reply: once / always / reject) instead of the
+ * headless member waiting forever.
+ */
+export interface PendingPermission {
+  /** The OpenCode permission request id (permission.ask input.id). */
+  id: string;
+  swarmId: string;
+  memberId: string;
+  sessionId: string;
+  type: string;
+  /** The requested pattern (command / path / url), untrusted data. */
+  pattern?: string;
+  title?: string;
+  /** null while pending; "once" | "always" | "reject" after answered. */
+  response: string | null;
+  respondedAt: number | null;
+  createdAt: number;
+}
+
+/** One row of the swarm event stream (timeline/replay). Written at key
+ * transitions (messages, task status changes, member status changes, spawns,
+ * permission walls, respawns) and rendered by `swarm_status detail:timeline`. */
+export interface SwarmEvent {
+  id: number;
+  swarmId: string;
+  type: string;
+  actorMemberId?: string;
+  entityType?: string;
+  entityId?: string;
+  payloadJson?: string;
+  createdAt: number;
+}
+
+/** A recorded handoff deliverable (handoff ledger). Created automatically when
+ * a member sends a `handoff` message; the coordinator can attach a verdict. */
+export interface Deliverable {
+  id: string;
+  swarmId: string;
+  memberId: string;
+  taskId?: string;
+  summary: string;
+  refs?: string[];
+  /** @file: paths referenced in the handoff (artifact paths). */
+  files?: string[];
+  /** null while open; "accepted" | "rejected" after the coordinator verdicts. */
+  verdict: string | null;
+  verdictBy?: string;
+  verdictAt?: number;
+  createdAt: number;
+}
+
+/** A typed blackboard contract: JSON-schema for a blackboard key (e.g.
+ * `contracts/*`). Writes to a contracted key are validated against the
+ * schema; changelog entries are recorded in the event stream. */
+export interface ContractDefinition {
+  id: string;
+  swarmId: string;
+  /** The blackboard key this contract governs (exact match). */
+  keyPattern: string;
+  /** JSON-schema (draft-07 subset) the value must satisfy. */
+  schemaJson: string;
+  description?: string;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface SwarmTask {
   id: string;
   swarmId: string;

@@ -1,19 +1,30 @@
 import { tool } from "@opencode-ai/plugin";
 import type { PluginInput, Hooks } from "@opencode-ai/plugin";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import type { SwarmStore } from "./storage/store.js";
 import { SQLiteStore } from "./storage/sqlite-store.js";
+import { ChunkDbStore } from "./storage/chunkdb-store.js";
+import { migrateSwarmDb } from "./storage/migrate.js";
 import { OpenCodeRuntime } from "./runtime/opencode-runtime.js";
 import { SwarmCore, BlackboardConflict, swarmTaskLeaseMs, detectAckReply } from "./core/swarm.js";
 import { Supervisor } from "./supervisor/supervisor.js";
 import { Recovery } from "./supervisor/recovery.js";
+import { StallDiagnoser } from "./supervisor/stalls.js";
+import type { StallDiagnosis, StallHost, UsageLimitRecord } from "./supervisor/stalls.js";
 import { Broker } from "./messaging/broker.js";
 import { Scheduler } from "./scheduler/scheduler.js";
 import { affinityScore } from "./scheduler/dag.js";
 import { corpseCountByPath, CORPSE_PILE_THRESHOLD, taskMentionsPath } from "./scheduler/scheduler.js";
 import { HumanChatTracker } from "./humanchat/tracker.js";
 import { formatInbox, formatEnvelope, formatBlackboardConflict } from "./messaging/formatter.js";
+import { enrichForeignSenderNames } from "./messaging/senders.js";
+import { extractAllMentionTokens, extractFileMentions, extractMemberMentions, extractTaskMentions } from "./messaging/mentions.js";
+import { ReviveEngine } from "./revive/revive.js";
+import { EmergencyGuard, emergencyBlockMessage, emergencyAutoTripHeader, CONFIRM_CLEAR, CONFIRM_STOP, CONFIRM_NUKE } from "./emergency/killswitch.js";
 import { fence } from "./core/fence.js";
+import { recordEvent } from "./core/events.js";
+import { renderTimeline } from "./messaging/timeline.js";
 import { propagateAutopermissions, permsCountsSummary } from "./permissions/propagate.js";
 import { permissionMode, permissionModeLabel } from "./permissions/clamp.js";
 import { buildHiveBlock, buildHiveSummary } from "./hive/diagnostics.js";
@@ -21,8 +32,9 @@ import { computeBeliefDigest } from "./hive/digest.js";
 import { rankBeliefsByRelevance, semanticRelevanceHook } from "./hive/relevance.js";
 import { computeResonance, consolidationAction, causalChainNote, parseEvidenceRefs } from "./hive/resonance.js";
 import { needTokens } from "./messaging/need.js";
+import { summarizeSchema, type JsonSchema } from "./storage/json-schema.js";
 import type { HiveReadInput } from "./hive/diagnostics.js";
-import type { SwarmMember, SwarmMessage } from "./core/types.js";
+import type { PendingPermission, Swarm, SwarmMember, SwarmMessage } from "./core/types.js";
 
 /** Max times a member is auto-continued after an idle turn before the plugin
  * gives up and surfaces the member to the coordinator as stuck. */
@@ -111,20 +123,68 @@ async function memberForContext(
   return member;
 }
 
+export interface MentionResolution {
+  mentionedResolved: string[];
+  mentionedUnresolved: string[];
+  tasksResolved: Array<{ ref: string; id: string; title: string; status: string }>;
+  tasksUnresolved: string[];
+  filesResolved: string[];
+  filesUnresolved: string[];
+}
+
 /**
- * Resolve a member's requested model to a real, available model. If the model
- * is missing or invalid (e.g. a tier label used as a provider), fall back to
- * the coordinator's own model so the spawn doesn't fail.
+ * Resolve @mentions in a message body (rich-agent-mentions):
+ *   - `@name`      against swarm members (case-insensitive)
+ *   - `#task`      against task ids AND titles
+ *   - `@file:path` against the swarm worktree (must exist on disk)
+ * Returns resolved/unresolved buckets so the tool output can seed context and
+ * surface dangling references (GitHub-style "unresolved reference" hints).
  */
-async function resolveMemberModel(
-  rt: SwarmPluginRuntime,
-  requested: { providerID?: string; modelID?: string } | undefined,
-  fallback?: { providerID?: string; modelID?: string },
-): Promise<{ providerID: string; modelID: string } | undefined> {
-  const resolved = await rt.resolveModel(requested);
-  if (resolved) return resolved;
-  const fb = await rt.resolveModel(fallback);
-  return fb;
+async function resolveMentions(
+  core: SwarmCore,
+  swarm: { id: string; directory?: string },
+  body: string,
+): Promise<MentionResolution> {
+  const [members, tasks] = await Promise.all([
+    core.store.listMembers(swarm.id),
+    core.store.listTasks(swarm.id),
+  ]);
+  const memberByLower = new Map(members.map((m) => [m.name.toLowerCase(), m.name]));
+  const tokens = extractAllMentionTokens(body);
+  const mentionedResolved: string[] = [];
+  const mentionedUnresolved: string[] = [];
+  for (const tok of tokens) {
+    const canonical = memberByLower.get(tok.toLowerCase());
+    if (canonical && !mentionedResolved.includes(canonical)) mentionedResolved.push(canonical);
+    else if (!mentionedResolved.some((n) => n.toLowerCase() === tok.toLowerCase())) mentionedUnresolved.push(tok);
+  }
+
+  const tasksResolved: MentionResolution["tasksResolved"] = [];
+  const tasksUnresolved: string[] = [];
+  const taskById = new Map(tasks.map((t) => [t.id, t]));
+  const taskByTitleLower = new Map(tasks.map((t) => [t.title.toLowerCase(), t]));
+  for (const ref of extractTaskMentions(body)) {
+    const task = taskById.get(ref) ?? taskByTitleLower.get(ref.toLowerCase());
+    if (task) {
+      tasksResolved.push({ ref, id: task.id, title: task.title, status: task.status });
+    } else if (!tasksUnresolved.includes(ref)) {
+      tasksUnresolved.push(ref);
+    }
+  }
+
+  const filesResolved: string[] = [];
+  const filesUnresolved: string[] = [];
+  const root = swarm.directory?.replace(/[\\/]+$/, "") ?? "";
+  for (const ref of extractFileMentions(body)) {
+    const abs = join(root, ref);
+    if (existsSync(abs) || existsSync(ref)) {
+      filesResolved.push(ref);
+    } else {
+      filesUnresolved.push(ref);
+    }
+  }
+
+  return { mentionedResolved, mentionedUnresolved, tasksResolved, tasksUnresolved, filesResolved, filesUnresolved };
 }
 
 /**
@@ -239,6 +299,22 @@ export function swarmRuntime(): SwarmPluginRuntime | undefined {
   return singleton;
 }
 
+/**
+ * Test hook: unconditionally drop the module-level singleton so the NEXT
+ * initSwarmRuntime call builds a fresh runtime. Test files share bun workers,
+ * so a sticky singleton leaks one test file's runtime (store + client) into
+ * another — the recurring cross-swarm identity-mixup flake. Harnesses call
+ * this in initPlugin before re-initializing to make every file deterministic.
+ */
+export function disposeSwarmRuntime(): void {
+  if (singleton) {
+    try {
+      singleton.dispose();
+    } catch { /* best-effort */ }
+    singleton = undefined;
+  }
+}
+
 export interface SwarmPluginOptions {
   /** Directory for the plugin-owned SQLite store. */
   dataDir?: string;
@@ -250,14 +326,39 @@ export interface SwarmPluginOptions {
    * headless member sessions never wedge. The coordinator's own prompts are
    * unaffected. Default: false. */
   allowAllMemberPermissions?: boolean;
+  /** Default model used when spawning a member with no explicit model and no
+   * last-used model is known. Default: deepseek-v4-flash on opencode-go.
+   * Set in the plugin config entry: ["<path>/dist/index.js", { "defaultMemberModel": { "providerID": "...", "modelID": "..." } }]. */
+  defaultMemberModel?: { providerID: string; modelID: string };
+  /** Persistence backend for the swarm store. 'sqlite' (default) keeps the
+   * existing .../swarms.db; 'chunkdb' uses .../swarms.chunkdb (compressed KV).
+   * When 'chunkdb' is selected and no chunkdb file exists yet but a legacy
+   * swarms.db does, the sqlite data is migrated automatically on startup. */
+  storeBackend?: "sqlite" | "chunkdb";
 }
 
-export class SwarmPluginRuntime {
+/** Model used for spawned members when nothing more specific is known. */
+const DEFAULT_MEMBER_MODEL = { providerID: "opencode-go", modelID: "deepseek-v4-flash" } as const;
+
+/** Blackboard key (per swarm) recording the last model actually assigned to a
+ * member — the durable half of the last-used tuple (survives restarts). */
+const LAST_USED_MODEL_KEY = "context/model/last-used";
+
+export class SwarmPluginRuntime implements StallHost {
   readonly core: SwarmCore;
   readonly supervisor: Supervisor;
   readonly broker: Broker;
   readonly scheduler: Scheduler;
   readonly humanChat: HumanChatTracker;
+  /** Stall auto-diagnosis + escalation ladder (task t-stalls): unifies the
+   * watchdog, permission walls, lease expiry, and model usage-limit hits into
+   * one classifier; the sweep calls executeNext after the existing watchdog
+   * pass. This runtime implements StallHost (messaging/actions live here). */
+  readonly stalls: StallDiagnoser;
+  /** Layered kill switch (task t-emergency): freeze/stop/nuke + auto tripwires.
+   * Read by the scheduler, broker, and spawn/message/task hot paths so a
+   * tripped system refuses machinery while the user's chat stays untouched. */
+  readonly emergency: EmergencyGuard;
   private runtime: OpenCodeRuntime;
   /** Public accessor for the runtime adapter (used by tool handlers that must
    * kick off prompts directly, e.g. the pull-claim full transition). */
@@ -307,15 +408,35 @@ export class SwarmPluginRuntime {
    * fires only when the stale digest value itself changes (beliefs moved
    * again), never every sweep while health stays stale. */
   private lastDigestSync = new Map<string, string>();
+  /** Per-swarm last-used member model tuple (in-memory half; the blackboard
+   * `context/model/last-used` key is the durable half). */
+  private lastUsedModel = new Map<string, { providerID: string; modelID: string }>();
+  /** Pending-permission ids already escalated to a coordinator (permission-stall
+   * escalation): ONE notification per pending prompt, never more — a re-raise
+   * of the same prompt (same ask id) must not spam the coordinator. */
+  private notifiedPermissionIds = new Set<string>();
+  /** The default member model (config `defaultMemberModel`). */
+  readonly defaultMemberModel: { providerID: string; modelID: string };
 
   constructor(
     public readonly store: SwarmStore,
     runtime: OpenCodeRuntime,
     private sweepMs: number = 10_000,
     public readonly allowAllMemberPermissions = false,
+    defaultMemberModel?: { providerID: string; modelID: string },
+    emergencyFile = "",
   ) {
     this.runtime = runtime;
+    this.defaultMemberModel = defaultMemberModel ?? { ...DEFAULT_MEMBER_MODEL };
     this.core = new SwarmCore(store, runtime);
+    // Layered kill switch (t-emergency): durable state file read at init
+    // (initSwarmRuntime awaits emergency.load() before returning) so a tripped
+    // system stays tripped across restarts. Defaults to untripped.
+    this.emergency = new EmergencyGuard(emergencyFile);
+    // Stall auto-diagnosis host: the runtime IS the host (store + runtime
+    // adapter + outward messaging actions). Created before the broker/scheduler
+    // so their error hooks can record usage-limit signals into it.
+    this.stalls = new StallDiagnoser(this);
     this.supervisor = new Supervisor(store);
     this.humanChat = new HumanChatTracker(
       { store, now: Date.now },
@@ -325,6 +446,18 @@ export class SwarmPluginRuntime {
     // with them (the member is answering the user, not the swarm).
     this.broker = new Broker(store, runtime, {
       deliveryCooldownMs: 30_000,
+      // Emergency kill switch (t-emergency): while tripped, ALL mailbox
+      // delivery halts (deliverToIdleMember returns 0) — swarm machinery
+      // freezes, the user's chat is untouched. Mail stays queued and resumes
+      // after clear.
+      shouldBlockDelivery: () => this.emergency.tripped,
+      // Usage-limit detection: a delivery failure with a limit-like message
+      // (limit/quota/rate/429/billing) is recorded so the stall diagnoser can
+      // surface reason 'usage-limit' with the coordinator remedy.
+      onDeliveryError: (memberId: string, error: string) =>
+        this.stalls.recordLimitSignal(memberId, error).then(() => undefined).catch((err) => {
+          console.error(`[swarm] usage-limit recording on delivery error failed:`, err);
+        }),
       shouldDeferDelivery: async (memberId: string) => {
         const member = await store.getMemberById(memberId);
         if (!member) return false;
@@ -340,7 +473,15 @@ export class SwarmPluginRuntime {
         });
       },
     });
-    this.scheduler = new Scheduler(store, runtime);
+    this.scheduler = new Scheduler(store, runtime, {
+      // Usage-limit detection: a kickoff failure with a limit-like message is
+      // recorded for stall diagnosis (the scheduler's release path is
+      // unchanged — this hook is advisory).
+      onKickoffError: (memberId: string, error: unknown) =>
+        this.stalls.recordLimitSignal(memberId, errorText(error)).then(() => undefined).catch((err) => {
+          console.error(`[swarm] usage-limit recording on kickoff error failed:`, err);
+        }),
+    });
     // Auto-wake: delivering a message to an idle member wakes it immediately.
     this.core.setWakeDeliverer((memberId, memberSessionId) =>
       this.broker.deliverToIdleMember(memberId, memberSessionId),
@@ -437,6 +578,13 @@ export class SwarmPluginRuntime {
       });
       await this.reviveInterrupted(swarmId);
       await this.watchdog(swarmId);
+      // Stall auto-diagnosis + escalation ladder (task t-stalls): after the
+      // existing watchdog pass, run ONE ladder step per stuck member (nudge →
+      // permission/usage notify → coordinator blocker → release-task). The
+      // ladder is layered ON TOP of the watchdog — existing behavior unchanged.
+      await this.stalls.executeNext(swarmId).catch((err) => {
+        console.error(`[swarm] stall ladder sweep failed for ${swarmId}:`, err);
+      });
       await this.syncSwarm(swarmId);
       // P5 Hive H2: pruning-truth notice — expire stale beliefs and surface a
       // compact truthful finding to the coordinator ONLY when something was
@@ -921,6 +1069,16 @@ export class SwarmPluginRuntime {
         await this.store.updateTaskStatus(taskId, "working");
       }
     }
+    // Timeline: the member's session was re-created after a crash/restart.
+    // Best-effort; never fails the respawn.
+    await recordEvent(this.store, {
+      swarmId: swarm.id,
+      type: "member.respawned",
+      actorMemberId: member.id,
+      entityType: "member",
+      entityId: member.id,
+      payloadJson: JSON.stringify({ name: member.name, taskId: taskId ?? null }),
+    });
     return session.id;
   }
 
@@ -997,6 +1155,10 @@ export class SwarmPluginRuntime {
    * Active advisory PathClaims are passed so the scheduler can emit
    * claim-aware warnings (WIP Aura, H0 — advisory, not enforced). */
   async runScheduler(swarmId: string, opts?: { skipAssignmentFor?: ReadonlySet<string> }): Promise<void> {
+    // Emergency kill switch (t-emergency): while tripped the scheduler is a
+    // no-op — no task assignment, no kickoff, no churn. Cleared by the
+    // operator via swarm_emergency(action: clear).
+    if (this.emergency.tripped) return;
     const swarm = await this.store.getSwarm(swarmId);
     if (!swarm || swarm.status !== "active") return;
     const [activeClaims, annotations] = await Promise.all([
@@ -1333,9 +1495,304 @@ export class SwarmPluginRuntime {
     );
   }
 
+  /**
+   * Escalate a member's pending permission prompt to the swarm coordinator
+   * (permission-stall escalation). Deduplicated by permission id — one
+   * notification per pending prompt, never more. The body is a RICH, actionable
+   * finding: who is blocked, on what (pattern fenced as untrusted data), and
+   * the exact swarm_permissions recipe to answer it. Same-swarm delivery, no
+   * force needed (fromMemberId is a member of the target swarm).
+   */
+  async notifyPermissionPrompt(p: PendingPermission, contextNote?: string): Promise<void> {
+    if (this.notifiedPermissionIds.has(p.id)) return;
+    this.notifiedPermissionIds.add(p.id);
+    const member = await this.store.getMemberById(p.memberId);
+    if (!member) return;
+    const swarm = await this.store.getSwarm(p.swarmId);
+    if (!swarm) return;
+    const coordMember = await this.store.getMemberById(swarm.coordinatorMemberId);
+    const patternText = p.pattern ?? p.title ?? "";
+    const lines = [
+      `[PERMISSION WALL] member '${member.name}' is blocked on ${p.type}: ${patternText ? fence(patternText) : "(no pattern)"}`,
+      ...(contextNote ? [contextNote] : []),
+      `Answer now: swarm_permissions(swarmId: '${p.swarmId}', action: 'reply', permissionId: '${p.id}', response: 'once' | 'always' | 'reject')`,
+    ];
+    await this.core.sendMessage({
+      swarmId: p.swarmId,
+      fromMemberId: p.memberId,
+      to: coordMember?.name ?? "coordinator",
+      kind: "finding",
+      priority: "high",
+      noreply: true,
+      message: lines.join("\n"),
+    }).catch((err) => {
+      // The notification is advisory — a delivery failure must not throw into
+      // the permission.ask path (the prompt itself is already recorded).
+      console.error(`[swarm] permission-wall notice to coordinator failed:`, err);
+    });
+  }
+
+  /** Answer a member's pending permission prompt via the runtime adapter
+   * (swarm_permissions reply path). Returns false when the prompt is already
+   * gone (answered/expired) or the runtime cannot reach it. */
+  replyPermission(sessionID: string, permissionID: string, response: "once" | "always" | "reject"): Promise<boolean> {
+    return this.runtime.replyPermission?.(sessionID, permissionID, response) ?? Promise.resolve(false);
+  }
+
+  /**
+   * Blocked-recipient detection (permission-stall escalation): after a message
+   * send/reply, check whether any recipient is stuck behind a pending
+   * permission prompt. For each such prompt, notify the recipient's coordinator
+   * IMMEDIATELY — the message sits in the blocked member's mailbox unprocessable
+   * until the wall is lifted, and the coordinator is the only one who can lift
+   * it. Returns the blocked prompts so the calling tool can surface them.
+   * Delivery is NOT changed: the message stays queued/delivered normally.
+   */
+  async detectBlockedRecipients(msgs: SwarmMessage[], callerName: string): Promise<PendingPermission[]> {
+    const targets = Array.from(
+      new Set(msgs.map((m) => m.to.memberId).filter((id): id is string => !!id)),
+    );
+    if (targets.length === 0) return [];
+    const blocked = await this.store.listPendingForMembers(targets);
+    for (const p of blocked) {
+      await this.notifyPermissionPrompt(
+        p,
+        `a message from '${callerName}' is waiting in the blocked member's mailbox`,
+      ).catch((err) => {
+        console.error(`[swarm] blocked-recipient notification failed:`, err);
+      });
+    }
+    return blocked;
+  }
+
+  // ==== Emergency kill switch (task t-emergency: layered shutoff + tripwires) ====
+
+  /** FREEZE effect: pause every active swarm in the store. Returns count. */
+  async emergencyFreeze(): Promise<number> {
+    let paused = 0;
+    for (const swarmId of await this.store.listAllMemberSwarmIds()) {
+      const swarm = await this.store.getSwarm(swarmId);
+      if (swarm && swarm.status === "active") {
+        await this.store.updateSwarmStatus(swarmId, "paused");
+        paused++;
+      }
+    }
+    return paused;
+  }
+
+  /** STOP effect: freeze + stop every worker member + cancel every non-terminal
+   * task. Returns counts. */
+  async emergencyStop(): Promise<{ paused: number; stopped: number; cancelled: number }> {
+    const paused = await this.emergencyFreeze();
+    let stopped = 0;
+    let cancelled = 0;
+    const terminal = new Set(["completed", "failed", "cancelled"]);
+    for (const swarmId of await this.store.listAllMemberSwarmIds()) {
+      for (const m of await this.store.listMembers(swarmId)) {
+        if (m.role !== "coordinator") {
+          await this.store.updateMemberStatus(m.id, "stopped");
+          stopped++;
+        }
+      }
+      for (const t of await this.store.listTasks(swarmId)) {
+        if (!terminal.has(t.status)) {
+          const ok = await this.store.updateTaskStatus(t.id, "cancelled");
+          if (ok) cancelled++;
+        }
+      }
+    }
+    return { paused, stopped, cancelled };
+  }
+
+  /** NUKE effect: delete EVERY swarm in the store. Returns count. IRREVERSIBLE. */
+  async emergencyNuke(): Promise<number> {
+    const swarmIds = await this.store.listAllMemberSwarmIds();
+    for (const id of swarmIds) {
+      await this.store.deleteSwarm(id);
+    }
+    return swarmIds.length;
+  }
+
+  /** CLEAR effect: unpause every paused swarm, reset the guard (untrip +
+   * counters). Returns count resumed. */
+  async emergencyClear(): Promise<number> {
+    let resumed = 0;
+    for (const swarmId of await this.store.listAllMemberSwarmIds()) {
+      const swarm = await this.store.getSwarm(swarmId);
+      if (swarm && swarm.status === "paused") {
+        await this.store.updateSwarmStatus(swarmId, "active");
+        resumed++;
+      }
+    }
+    await this.emergency.clear();
+    return resumed;
+  }
+
+  /** Auto-trip notify (tripwires): tell EVERY coordinator session about the
+   * auto-freeze with the distinct [EMERGENCY] header — deduped once per trip
+   * via the guard's needNotify/markNotified. Never touches worker sessions. */
+  async notifyEmergencyAutoTrip(reason: string): Promise<void> {
+    if (!this.emergency.needNotify()) return;
+    this.emergency.markNotified();
+    const header = emergencyAutoTripHeader(reason);
+    for (const swarmId of await this.store.listAllMemberSwarmIds()) {
+      const swarm = await this.store.getSwarm(swarmId);
+      if (!swarm) continue;
+      this.runtime.promptAsync({ text: header }, swarm.coordinatorSessionId).catch((err) => {
+        console.error(`[swarm] emergency auto-trip notice failed:`, err);
+      });
+    }
+  }
+
+  /** Count total member rows across the store (hard-cap tripwire input). */
+  async countAllMembers(): Promise<number> {
+    let total = 0;
+    for (const swarmId of await this.store.listAllMemberSwarmIds()) {
+      total += (await this.store.listMembers(swarmId)).length;
+    }
+    return total;
+  }
+
+  /**
+   * Spawn guard (swarm_delegate/swarm_spawn/swarm_task): refuses when tripped;
+   * enforces the hard member cap (refuse outright AND trip); increments the
+   * spawn-rate counter and auto-trips on exceed — the current call is then
+   * REFUSED (the swarm is already paused, so the spawn cannot complete cleanly).
+   * Returns the refusal message or null.
+   */
+  async emergencySpawnGuard(spawnCount: number): Promise<string | null> {
+    const guard = this.emergency;
+    if (guard.tripped) return emergencyBlockMessage(guard.level);
+    const total = await this.countAllMembers();
+    if (guard.memberCapExceeded(total)) {
+      await guard.trip("freeze", "auto-cap", `member cap reached (${total} >= ${guard.memberCap()})`);
+      await this.emergencyFreeze();
+      await this.notifyEmergencyAutoTrip(`member cap reached (${total} >= ${guard.memberCap()})`);
+      return emergencyBlockMessage("freeze");
+    }
+    const { count, exceeded } = guard.recordSpawn(spawnCount);
+    if (exceeded) {
+      const reason = `spawn rate exceeded (${count}/min)`;
+      await guard.trip("freeze", "auto-tripwire", reason);
+      await this.emergencyFreeze();
+      await this.notifyEmergencyAutoTrip(reason);
+      return emergencyBlockMessage("freeze");
+    }
+    return null;
+  }
+
+  /** Message guard (swarm_message/swarm_reply): increments the per-swarm
+   * message counter; auto-trips on exceed. Never refuses the current send. */
+  async emergencyMessageGuard(swarmId: string): Promise<void> {
+    const guard = this.emergency;
+    if (guard.tripped) return;
+    const { count, exceeded } = guard.recordMessage(swarmId);
+    if (exceeded) {
+      const reason = `message rate exceeded (${count}/min)`;
+      await guard.trip("freeze", "auto-tripwire", reason);
+      await this.emergencyFreeze();
+      await this.notifyEmergencyAutoTrip(reason);
+    }
+  }
+
+  /** Task guard (swarm_delegate seedTasks / swarm_create / swarm_task):
+   * refuses when tripped; increments the task-rate counter and auto-trips on
+   * exceed. Returns the refusal message or null. */
+  async emergencyTaskGuard(amount = 1): Promise<string | null> {
+    const guard = this.emergency;
+    if (guard.tripped) return emergencyBlockMessage(guard.level);
+    const { count, exceeded } = guard.recordTask(amount);
+    if (exceeded) {
+      const reason = `task rate exceeded (${count}/min)`;
+      await guard.trip("freeze", "auto-tripwire", reason);
+      await this.emergencyFreeze();
+      await this.notifyEmergencyAutoTrip(reason);
+    }
+    return null;
+  }
+
   /** List models the spawner has access to, via the runtime adapter. */
   listModels(): Promise<import("./runtime/runtime-types.js").RuntimeModelInfo[]> {
     return this.runtime.listModels?.() ?? Promise.resolve([]);
+  }
+
+  // ==== StallDiagnoser host (task t-stalls: stall auto-diagnosis + ladder) ====
+
+  /** Injectable clock for the stall diagnoser (tests fake it). */
+  now(): number {
+    return Date.now();
+  }
+
+  /** Rung 1 (nudge): re-drive a silent member, mirroring the existing watchdog
+   * nudge (syncMember = synthetic prompt; human-chat deferral applies). */
+  async nudgeMember(swarmId: string, member: SwarmMember, note: string): Promise<void> {
+    const swarm = await this.store.getSwarm(swarmId);
+    if (!swarm) return;
+    await this.core.syncMember(swarm, member, note);
+  }
+
+  /** Rung 2 (permission-wall): notify the coordinator with the reply recipe —
+   * deduped by permission id inside notifyPermissionPrompt. */
+  async notifyPermissionWall(permission: PendingPermission, contextNote?: string): Promise<void> {
+    await this.notifyPermissionPrompt(permission, contextNote);
+  }
+
+  /** Rung 2 (usage-limit): notify the coordinator with the EXACT remedy
+   * (swarm_permissions-style message). The diagnoser never auto-changes models
+   * — the coordinator decides via swarm_revive / a model change / waiting. */
+  async notifyUsageLimit(member: SwarmMember, record: UsageLimitRecord): Promise<void> {
+    const swarm = await this.store.getSwarm(member.swarmId);
+    if (!swarm) return;
+    const coordMember = await this.store.getMemberById(swarm.coordinatorMemberId);
+    await this.core.sendMessage({
+      swarmId: member.swarmId,
+      fromMemberId: member.id,
+      to: coordMember?.name ?? "coordinator",
+      kind: "finding",
+      priority: "high",
+      noreply: true,
+      message: [
+        `[USAGE LIMIT] member '${member.name}' hit model usage limits — signal: ${fence(record.signal)}`,
+        `Answer: ${record.remedy} (swarm_revive(swarmId: '${swarm.id}', action: 'revive', strategy: 'keep') / a model change, or wait for the limit window)`,
+      ].join("\n"),
+    }).catch((err) => {
+      console.error(`[swarm] usage-limit notice to coordinator failed:`, err);
+    });
+  }
+
+  /** Rung 3 (coordinator blocker): the ONE "why is my swarm stuck" answer, as
+   * a kind 'blocker' message (replyable, high priority). */
+  async notifyCoordinatorBlocker(swarm: Swarm, member: SwarmMember, diagnosis: StallDiagnosis): Promise<void> {
+    const coordMember = await this.store.getMemberById(swarm.coordinatorMemberId);
+    const lines = [
+      `[STALL BLOCKER] member '${member.name}' is stuck — reason: ${diagnosis.reason} (stalled ${Math.round(diagnosis.stallMs / 1000)}s)`,
+      ...diagnosis.evidence.map((e) => `  - ${e}`),
+      `the ONE answer: ${diagnosis.recipe}`,
+    ];
+    await this.core.sendMessage({
+      swarmId: swarm.id,
+      fromMemberId: member.id,
+      to: coordMember?.name ?? "coordinator",
+      kind: "blocker",
+      priority: "high",
+      message: lines.join("\n"),
+    }).catch((err) => {
+      console.error(`[swarm] stall blocker to coordinator failed:`, err);
+    });
+  }
+
+  /** Rung 4 (release-task): release the member's task WITHOUT consuming the
+   * retry budget (countAsRetry: false) and free the member for new work. */
+  async releaseMemberTask(member: SwarmMember, reason: string): Promise<boolean> {
+    if (!member.currentTaskId) return false;
+    const ok = await this.store.releaseTask(member.currentTaskId, { countAsRetry: false }).catch(() => false);
+    if (ok) {
+      await this.store
+        .updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: Date.now() })
+        .catch(() => undefined);
+      console.warn(`[swarm] stall ladder: released task ${member.currentTaskId} from ${member.name} (${reason})`);
+    }
+    return ok;
   }
 
   /**
@@ -1383,24 +1840,153 @@ export class SwarmPluginRuntime {
   resolveModel(model?: { providerID?: string; modelID?: string }): Promise<{ providerID: string; modelID: string } | undefined> {
     return this.runtime.resolveModel?.(model) ?? Promise.resolve(undefined);
   }
+
+  /**
+   * Resolve the model for a member spawn, walking a deterministic priority
+   * chain so members NEVER get a random runtime default:
+   *
+   *   1. `requested` — the explicit model on the member (if resolvable)
+   *   2. last-used tuple for this swarm (in-memory, then the durable
+   *      `context/model/last-used` blackboard key)
+   *   3. the coordinator session's CURRENT model (the user's live model)
+   *   4. config `defaultMemberModel` (default opencode-go/deepseek-v4-flash)
+   *   5. any available model (prefer zen-free) — last resort, reported as
+   *      "fallback" so the coordinator sees the swarm default is unavailable
+   *
+   * Returns `{ model, source, note }`; `source` is one of "requested" |
+   * "last-used" | "coordinator" | "default" | "fallback" | "none". The caller
+   * surfaces `source` (and `note` when a requested model was unusable) in the
+   * spawn output so the coordinator agent sees WHY each member got its model —
+   * the AUIX fix for "members got the wrong model" confusion.
+   */
+  async resolveSpawnModel(
+    swarmId: string,
+    requested?: { providerID?: string; modelID?: string },
+  ): Promise<{ model?: { providerID: string; modelID: string }; source: string; note?: string }> {
+    // A bad explicit request must be REPORTED (note), never silently ignored —
+    // that is the "member got the wrong model" confusion this chain fixes.
+    const hadRequest = !!(requested && (requested.providerID || requested.modelID));
+    const requestDesc = hadRequest ? `${requested!.providerID?.trim() || "?"}/${requested!.modelID?.trim() || "?"}` : undefined;
+    const notes: string[] = [];
+
+    // 1. Explicit request wins — if it resolves.
+    if (hadRequest) {
+      const resolved = await this.resolveModel(requested);
+      if (resolved) return { model: resolved, source: "requested" };
+      notes.push(`requested model '${requestDesc}' is not available here`);
+    }
+
+    // 2. Last-used tuple (memory, then blackboard).
+    const lastUsed = this.lastUsedModel.get(swarmId) ?? (await this.readLastUsedModel(swarmId));
+    if (lastUsed) {
+      const resolved = await this.resolveModel(lastUsed);
+      if (resolved) return { model: resolved, source: "last-used", ...(notes.length ? { note: notes.join("; ") } : {}) };
+    }
+
+    // 3. Coordinator's live session model — the user's actual current model.
+    try {
+      const swarm = await this.store.getSwarm(swarmId);
+      if (swarm) {
+        const coordSession = await this.runtimeAdapter.getSession(swarm.coordinatorSessionId);
+        const coordModel = coordSession?.model;
+        if (coordModel?.providerID && coordModel?.modelID) {
+          const resolved = await this.resolveModel(coordModel);
+          if (resolved) return { model: resolved, source: "coordinator", ...(notes.length ? { note: notes.join("; ") } : {}) };
+        }
+      }
+    } catch { /* runtime session lookup is best-effort */ }
+
+    // 4. Config default.
+    const def = await this.resolveModel(this.defaultMemberModel);
+    if (def) return { model: def, source: "default", ...(notes.length ? { note: notes.join("; ") } : {}) };
+
+    // 5. Last resort: ANY available model (cheapest tier first) — but say so.
+    const all = await this.listModels();
+    const anyModel = all.find((m) => m.tier === "zen-free") ?? all[0];
+    if (anyModel) {
+      notes.push(`configured default ${this.defaultMemberModel.providerID}/${this.defaultMemberModel.modelID} is not available on this machine`);
+      return {
+        model: { providerID: anyModel.providerID, modelID: anyModel.modelID },
+        source: "fallback",
+        note: notes.join("; "),
+      };
+    }
+
+    notes.push("no models are available on this machine; member spawned with the runtime default");
+    return { source: "none", note: notes.join("; ") };
+  }
+
+  /** Record the model a member was just spawned with (last-used tuple). */
+  async recordUsedModel(swarmId: string, model: { providerID: string; modelID: string }): Promise<void> {
+    this.lastUsedModel.set(swarmId, model);
+    try {
+      const swarm = await this.store.getSwarm(swarmId);
+      if (!swarm) return;
+      const coord = await this.store.getMemberBySessionId(swarm.coordinatorSessionId);
+      if (!coord) return;
+      const existing = await this.store.getBlackboard(swarmId, LAST_USED_MODEL_KEY);
+      await this.core.blackboardPut({
+        swarmId,
+        key: LAST_USED_MODEL_KEY,
+        value: JSON.stringify({ providerID: model.providerID, modelID: model.modelID, at: Date.now() }),
+        contentType: "application/json",
+        expectedVersion: existing?.version,
+        authorMemberId: coord.id,
+      });
+    } catch { /* blackboard write is best-effort (in-memory half still holds) */ }
+  }
+
+  /** Read the durable last-used tuple (per-swarm blackboard). */
+  private async readLastUsedModel(swarmId: string): Promise<{ providerID: string; modelID: string } | undefined> {
+    try {
+      const entry = await this.store.getBlackboard(swarmId, LAST_USED_MODEL_KEY);
+      if (!entry) return undefined;
+      const parsed = JSON.parse(entry.value) as { providerID?: string; modelID?: string };
+      if (parsed?.providerID && parsed?.modelID) {
+        return { providerID: parsed.providerID, modelID: parsed.modelID };
+      }
+    } catch { /* malformed value -> treat as absent */ }
+    return undefined;
+  }
 }
 
 export async function initSwarmRuntime(input: PluginInput, options: SwarmPluginOptions = {}): Promise<SwarmPluginRuntime> {
   if (singleton) return singleton;
-  const dbPath = (options.dataDir ?? input.directory)
-    .replace(/\\$/, "")
-    .concat("/.opencode/swarms/swarms.db");
+  const base = (options.dataDir ?? input.directory).replace(/\\$/, "");
+  const swarmsDir = `${base}/.opencode/swarms`;
   try {
-    mkdirSync(dbPath.replace(/[\\/]swarms\.db$/, ""), { recursive: true });
+    mkdirSync(swarmsDir, { recursive: true });
   } catch {
-    // best effort; SQLite will surface a clear error if it cannot open
+    // best effort; the store will surface a clear error if it cannot open
   }
-  const store =
-    options.store ??
-    new SQLiteStore(dbPath);
+  const backend = options.storeBackend ?? "sqlite";
+  let store: SwarmStore;
+  if (options.store) {
+    store = options.store;
+  } else if (backend === "chunkdb") {
+    const chunkdbPath = `${swarmsDir}/swarms.chunkdb`;
+    const sqlitePath = `${swarmsDir}/swarms.db`;
+    // Auto-migrate existing sqlite swarms the first time the chunkdb backend
+    // is selected (only when a chunkdb store does not exist yet).
+    if (!existsSync(chunkdbPath) && existsSync(sqlitePath)) {
+      try {
+        const counts = await migrateSwarmDb(sqlitePath, chunkdbPath);
+        console.info(`[swarm] auto-migrated sqlite → chunkdb (${sqlitePath} → ${chunkdbPath}): ${JSON.stringify(counts)}`);
+      } catch (err) {
+        console.error(`[swarm] auto-migration sqlite → chunkdb FAILED (${sqlitePath}):`, err);
+        throw err;
+      }
+    }
+    store = new ChunkDbStore(chunkdbPath);
+  } else {
+    store = new SQLiteStore(`${swarmsDir}/swarms.db`);
+  }
   await store.ready();
   const runtime = new OpenCodeRuntime(input.client as never, input.directory, input.worktree);
-  singleton = new SwarmPluginRuntime(store, runtime, 10_000, options.allowAllMemberPermissions ?? false);
+  singleton = new SwarmPluginRuntime(store, runtime, 10_000, options.allowAllMemberPermissions ?? false, options.defaultMemberModel, `${swarmsDir}/emergency.json`);
+  // Load the durable emergency state (t-emergency): a system that was tripped
+  // before a restart STAYS tripped after it.
+  await singleton.emergency.load();
   singleton.scheduleStartupRecovery();
 
   return singleton;
@@ -1446,7 +2032,7 @@ export async function swarmPlugin(
             name: tool.schema.string().describe("Member name."),
             role: tool.schema.string().describe("Role description."),
             agent: tool.schema.string().optional(),
-            model: tool.schema.object({ providerID: tool.schema.string(), modelID: tool.schema.string() }).optional(),
+            model: tool.schema.object({ providerID: tool.schema.string(), modelID: tool.schema.string() }).optional().describe("Optional. Omit to use the swarm default model (config defaultMemberModel; default deepseek-v4-flash on opencode-go). Only set when a specific model is required."),
             taskId: tool.schema.string().optional().describe("Task id to assign to this member."),
             prompt: tool.schema.string().optional().describe("Full working brief for this member (the scheduler also auto-assigns ready tasks)."),
             workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
@@ -1463,6 +2049,14 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+
+          // Emergency kill switch (t-emergency): refuse member spawns while
+          // tripped; enforce the hard member cap; count spawns toward the
+          // per-minute tripwire.
+          if ((args.members ?? []).length > 0) {
+            const refusal = await rt.emergencySpawnGuard((args.members ?? []).length);
+            if (refusal) return { output: refusal };
+          }
 
           // Seed the caller-provided task DAG onto a swarm. Idempotent: tasks
           // already present (by id or title) are skipped. Preserves stable task
@@ -1489,6 +2083,10 @@ export async function swarmPlugin(
                 createdByMemberId,
                 priority: t.priority,
               });
+              // Emergency kill switch (t-emergency): count task creations
+              // toward the per-minute tripwire (refuses when already tripped —
+              // the offending create may have completed, the next one stops).
+              await rt.emergencyTaskGuard();
               if (t.id) created.set(t.id, task.id);
               else created.set(task.title, task.id);
             }
@@ -1583,8 +2181,7 @@ export async function swarmPlugin(
 
           // Spawn members (each may carry its own prompt; otherwise the
           // scheduler assigns ready tasks automatically).
-          const spawned: Array<{ name: string; sessionId: string }> = [];
-          const callerModel = (await core.store.getMemberBySessionId(ctx.sessionID))?.model;
+          const spawned: Array<Record<string, unknown>> = [];
           for (const m of args.members) {
             const existing = await core.store.getMemberByName(swarmId!, m.name);
             if (existing) {
@@ -1599,11 +2196,16 @@ export async function swarmPlugin(
                   // instead of silently proceeding unbound (the affinity-
                   // misassignment class this iteration).
                   console.warn(`[swarm] delegate re-point: task ${m.taskId} not assigned to ${existing.name}: ${(err as Error).message}`);
+                  // Usage-limit detection: a kickoff failure may be a model
+                  // limit hit (limit/quota/rate/429/billing) — record it for
+                  // stall diagnosis (advisory).
+                  rt.stalls.recordLimitSignal(existing.id, errorText(err)).catch(() => undefined);
                 });
               }
               continue;
             }
-            const model = await resolveMemberModel(rt, m.model as never, callerModel);
+            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(swarmId!, m.model as never);
+            if (model) await rt.recordUsedModel(swarmId!, model);
             const member = await core.spawnMember({
               swarmId: swarmId!,
               name: m.name,
@@ -1614,7 +2216,13 @@ export async function swarmPlugin(
               prompt: m.prompt,
               workspace: m.workspace as never,
             });
-            spawned.push({ name: member.name, sessionId: member.sessionId });
+            spawned.push({
+              name: member.name,
+              sessionId: member.sessionId,
+              model: model ?? undefined,
+              modelSource,
+              ...(modelNote ? { modelNote } : {}),
+            });
           }
 
           // Self-driving: assign any remaining ready tasks to idle members.
@@ -1706,6 +2314,12 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           const projectId = input.project?.id ?? "global";
+          // Emergency kill switch (t-emergency): count seed-task creations
+          // toward the per-minute tripwire (refuses when already tripped).
+          if ((args.tasks ?? []).length > 0) {
+            const refusal = await rt.emergencyTaskGuard((args.tasks ?? []).length);
+            if (refusal) return { output: refusal };
+          }
           const result = await core.createSwarm({
             name: args.name,
             projectId,
@@ -1748,7 +2362,7 @@ export async function swarmPlugin(
           model: tool.schema.object({
             providerID: tool.schema.string(),
             modelID: tool.schema.string(),
-          }).optional(),
+          }).optional().describe("Optional. Omit to use the swarm default model (config defaultMemberModel; default deepseek-v4-flash on opencode-go). Only set when a specific model is required."),
           workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
         },
         async execute(args, ctx) {
@@ -1766,6 +2380,10 @@ export async function swarmPlugin(
           let taskId = args.taskId;
           if (!taskId) {
             if (!args.title) return { output: "taskId or title is required" };
+            // Emergency kill switch (t-emergency): refuse task creation while
+            // tripped; count toward the per-minute tripwire.
+            const refusal = await rt.emergencyTaskGuard();
+            if (refusal) return { output: refusal };
             const created = await core.createTask({
               swarmId: args.swarmId,
               title: args.title,
@@ -1783,7 +2401,13 @@ export async function swarmPlugin(
           // Ensure the member exists (spawn idempotently).
           let member = await core.store.getMemberByName(args.swarmId, args.name);
           if (!member) {
-            const model = await resolveMemberModel(rt, args.model as never, caller.model);
+            // Emergency kill switch (t-emergency): refuse member spawns while
+            // tripped; enforce the hard member cap; count toward the spawn
+            // rate tripwire.
+            const refusal = await rt.emergencySpawnGuard(1);
+            if (refusal) return { output: refusal };
+            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(args.swarmId, args.model as never);
+            if (model) await rt.recordUsedModel(args.swarmId, model);
             member = await core.spawnMember({
               swarmId: args.swarmId,
               name: args.name,
@@ -1794,6 +2418,7 @@ export async function swarmPlugin(
               prompt: args.prompt,
               workspace: args.workspace as never,
             });
+            member = { ...member, model, modelSource, modelNote } as never;
           } else {
             // Existing member: assign the task and kick off directly.
             try {
@@ -1802,6 +2427,9 @@ export async function swarmPlugin(
               // Assignment now goes through the claimTask CAS (NP2) — surface a
               // claim failure instead of silently proceeding unbound (the stale-
               // owner/affinity-misassignment class this iteration).
+              // Usage-limit detection: a kickoff failure may be a model limit
+              // hit — record it for stall diagnosis (advisory).
+              rt.stalls.recordLimitSignal(member.id, errorText(err)).catch(() => undefined);
               return {
                 output: `task '${taskId}' not assigned to '${args.name}': ${(err as Error).message}`,
               };
@@ -1812,7 +2440,12 @@ export async function swarmPlugin(
             title: `swarm: ${args.name}`,
             output: JSON.stringify({
               task: { id: taskId },
-              member: { name: member.name, sessionId: member.sessionId, status: member.status },
+              member: {
+                name: member.name,
+                sessionId: member.sessionId,
+                status: member.status,
+                ...((member as any).model ? { model: (member as any).model, modelSource: (member as any).modelSource, modelNote: (member as any).modelNote } : {}),
+              },
               note: "Member started. You will be notified when it finishes. Do not poll.",
             }, null, 2),
             metadata: { sessionId: member.sessionId, memberName: member.name, taskId },
@@ -1830,6 +2463,9 @@ export async function swarmPlugin(
           "Members are top-level OpenCode sessions — open them in the app to chat",
           "with them directly.",
           "Optionally set a model per member (use swarm_models to see options).",
+          "OMIT model unless a specific model is required — members default to the",
+          "swarm default (config defaultMemberModel; default deepseek-v4-flash on",
+          "opencode-go), then the last-used model, then the coordinator's model.",
           "You are notified (batched) as tasks complete.",
         ].join("\n"),
         args: {
@@ -1841,7 +2477,7 @@ export async function swarmPlugin(
             model: tool.schema.object({
               providerID: tool.schema.string().describe("Real provider id (e.g. opencode, opencode-go, lmstudio) — NOT a tier label."),
               modelID: tool.schema.string(),
-            }).optional(),
+            }).optional().describe("Optional. Omit to use the swarm default model (config defaultMemberModel; default deepseek-v4-flash on opencode-go). Only set when a specific model is required."),
             taskId: tool.schema.string().optional().describe("Task id to assign (for tracking/claims)."),
             prompt: tool.schema.string().describe("The full working brief for this member."),
             workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
@@ -1851,10 +2487,15 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
-          const callerModel = (await core.store.getMemberBySessionId(ctx.sessionID))?.model;
+          // Emergency kill switch (t-emergency): refuse member spawns while
+          // tripped; enforce the hard member cap; count spawns toward the
+          // per-minute tripwire.
+          const refusal = await rt.emergencySpawnGuard(args.members.length);
+          if (refusal) return { output: refusal };
           const created: Array<Record<string, unknown>> = [];
           for (const m of args.members) {
-            const model = await resolveMemberModel(rt, m.model as never, callerModel);
+            const { model, source: modelSource, note: modelNote } = await rt.resolveSpawnModel(args.swarmId, m.model as never);
+            if (model) await rt.recordUsedModel(args.swarmId, model);
             const member = await core.spawnMember({
               swarmId: args.swarmId,
               name: m.name,
@@ -1870,7 +2511,9 @@ export async function swarmPlugin(
               memberId: member.id,
               sessionId: member.sessionId,
               status: member.status,
-              model,
+              model: model ?? undefined,
+              modelSource,
+              ...(modelNote ? { modelNote } : {}),
             });
           }
           // Run the scheduler so ready tasks are claimed by the freshly-spawned
@@ -1890,6 +2533,14 @@ export async function swarmPlugin(
           "no response is expected — use for status broadcasts and notices so peers",
           "don't burn turns on ack-only replies. Kinds that demand a response",
           "(request/blocker/handoff/review) can never be noreply.",
+          "Cross-swarm: to message a member of a DIFFERENT swarm (you are not a",
+          "member of it), set force: true. The recipient resolves inside the target",
+          "swarm; you must be a registered member of your own swarm. Recipients see",
+          "the sender as 'name@swarm' so the origin is always clear.",
+          "MENTIONS (GitHub-style): @name pulls a member into the conversation — the",
+          "message is ALSO delivered to them (auto-notify). @file:path references a",
+          "file in the swarm worktree; #task references a task by id or title. The",
+          "output reports resolved/unresolved references.",
         ].join("\n"),
         args: {
           swarmId: tool.schema.string().describe("Swarm id."),
@@ -1902,6 +2553,7 @@ export async function swarmPlugin(
           priority: tool.schema.enum(["low", "normal", "high", "urgent"]).optional(),
           refs: tool.schema.array(tool.schema.string()).optional(),
           noreply: tool.schema.boolean().optional().describe("Mark fire-and-forget: recipient is not expected to reply."),
+          force: tool.schema.boolean().optional().describe("Cross-swarm: message into a swarm you are NOT a member of. Recipient resolves inside the target swarm."),
         },
         async execute(args, ctx) {
           const rt = await ensureRt();
@@ -1919,6 +2571,7 @@ export async function swarmPlugin(
             priority: args.priority ?? "normal",
             refs: args.refs,
             noreply: args.noreply,
+            force: args.force,
           });
           // sendMessage now returns PERSISTED post-wake states (audit/messaging
           // F-M1): delivered = injected now, scheduled = claimed mid-flight,
@@ -1926,17 +2579,45 @@ export async function swarmPlugin(
           // Report real verdicts so "queued ≠ resend" is structural (TU4).
           const members = await core.store.listMembers(args.swarmId);
           const nameById = new Map(members.map((m) => [m.id, m.name]));
+          // @mention resolution (rich-agent-mentions): seed context + surface
+          // unresolved references (GitHub-style).
+          const swarmForMentions = await core.store.getSwarm(args.swarmId);
+          const mentions = await resolveMentions(core, swarmForMentions ?? { id: args.swarmId }, args.message);
+          const hasMentions =
+            mentions.mentionedResolved.length > 0 || mentions.mentionedUnresolved.length > 0 ||
+            mentions.tasksResolved.length > 0 || mentions.tasksUnresolved.length > 0 ||
+            mentions.filesResolved.length > 0 || mentions.filesUnresolved.length > 0;
+          // Blocked-recipient detection: if any recipient is stuck behind a
+          // pending permission prompt, notify their coordinator immediately
+          // (permission-stall escalation) and surface it in the output.
+          const callerMember = await core.store.getMemberBySessionId(ctx.sessionID);
+          const blocked = await rt.detectBlockedRecipients(msgs, callerMember?.name ?? ctx.sessionID);
+          // Emergency kill switch (t-emergency): count messages toward the
+          // per-swarm per-minute tripwire (never refuses the current send).
+          await rt.emergencyMessageGuard(args.swarmId);
           const delivered = msgs.filter((m) => m.deliveryState === "delivered" || m.deliveryState === "scheduled");
           const pending = msgs.filter((m) => m.deliveryState === "queued");
+          const mentionNote = mentions.mentionedResolved.length
+            ? ` mentioned ${mentions.mentionedResolved.join(", ")} (message also delivered to them)`
+            : "";
           const summary = msgs.length === 0
             ? "message sent (no recipients)"
-            : `delivered to ${delivered.length} now${pending.length ? `, ${pending.length} pending (will arrive on next wake)` : ""}`;
+            : `delivered to ${delivered.length} now${pending.length ? `, ${pending.length} pending (will arrive on next wake)` : ""}${mentionNote}`;
           return {
             output: JSON.stringify({
               summary,
               deliveredTo: delivered.map((m) => nameById.get(m.to.memberId ?? "") ?? m.to.memberId ?? ""),
               pendingFor: pending.map((m) => nameById.get(m.to.memberId ?? "") ?? m.to.memberId ?? ""),
               messages: msgs.map((m) => ({ id: m.id, to: m.to, kind: m.kind, state: m.deliveryState })),
+              ...(hasMentions ? { mentions } : {}),
+              ...(blocked.length
+                ? {
+                    blockedByPermission: blocked.map((p) => ({ memberId: p.memberId, permissionId: p.id, type: p.type, pattern: p.pattern })),
+                    note: blocked
+                      .map((p) => `"${nameById.get(p.memberId) ?? p.memberId} is blocked on a permission prompt (${p.type}${p.pattern ? ` ${fence(p.pattern)}` : ""}) — the coordinator has been notified to answer it"`)
+                      .join(" "),
+                  }
+                : {}),
             }, null, 2),
           };
         },
@@ -1949,6 +2630,13 @@ export async function swarmPlugin(
           "request/response threads are preserved without routing through the coordinator.",
           "Warns (softly) when replying to a noreply message or when the reply looks",
           "like an ack-only response — send only if you can act or add information.",
+          "Cross-swarm: replying to a message that came FROM another swarm routes the",
+          "reply into the original sender's swarm automatically (their mailbox).",
+          "If you pass the FOREIGN swarm id as swarmId, set force: true so the caller",
+          "membership check is bypassed — the reply still lands in the original",
+          "sender's swarm.",
+          "MENTIONS: @name in the reply also delivers it to that member; @file:path",
+          "and #task references are resolved and reported in the output.",
         ].join("\n"),
         args: {
           swarmId: tool.schema.string().describe("Swarm id."),
@@ -1958,6 +2646,7 @@ export async function swarmPlugin(
           priority: tool.schema.enum(["low", "normal", "high", "urgent"]).optional(),
           refs: tool.schema.array(tool.schema.string()).optional(),
           noreply: tool.schema.boolean().optional().describe("Mark this reply fire-and-forget (informational follow-up)."),
+          force: tool.schema.boolean().optional().describe("Cross-swarm: bypass the caller-membership check when replying to a message owned by another swarm."),
         },
         async execute(args, ctx) {
           const rt = await ensureRt();
@@ -1983,11 +2672,38 @@ export async function swarmPlugin(
             priority: args.priority,
             refs: args.refs,
             noreply: args.noreply,
+            force: args.force,
           });
+          // Blocked-recipient detection: if the reply's recipient is stuck
+          // behind a pending permission prompt, notify their coordinator
+          // immediately (permission-stall escalation) and surface it.
+          const callerMember = await core.store.getMemberBySessionId(ctx.sessionID);
+          const blocked = await rt.detectBlockedRecipients(msgs, callerMember?.name ?? ctx.sessionID);
+          // Emergency kill switch (t-emergency): count replies toward the
+          // per-swarm per-minute message tripwire.
+          await rt.emergencyMessageGuard(args.swarmId);
+          const members = await core.store.listMembers(args.swarmId);
+          const nameById = new Map(members.map((m) => [m.id, m.name]));
+          // @mention resolution (rich-agent-mentions).
+          const swarmForMentions = await core.store.getSwarm(args.swarmId);
+          const mentions = await resolveMentions(core, swarmForMentions ?? { id: args.swarmId }, args.message);
+          const hasMentions =
+            mentions.mentionedResolved.length > 0 || mentions.mentionedUnresolved.length > 0 ||
+            mentions.tasksResolved.length > 0 || mentions.tasksUnresolved.length > 0 ||
+            mentions.filesResolved.length > 0 || mentions.filesUnresolved.length > 0;
           return {
             output: JSON.stringify({
               delivered: msgs.map((m) => ({ id: m.id, to: m.to, kind: m.kind, state: m.deliveryState })),
               ...(warnings.length ? { warnings } : {}),
+              ...(hasMentions ? { mentions } : {}),
+              ...(blocked.length
+                ? {
+                    blockedByPermission: blocked.map((p) => ({ memberId: p.memberId, permissionId: p.id, type: p.type, pattern: p.pattern })),
+                    note: blocked
+                      .map((p) => `"${nameById.get(p.memberId) ?? p.memberId} is blocked on a permission prompt (${p.type}${p.pattern ? ` ${fence(p.pattern)}` : ""}) — the coordinator has been notified to answer it"`)
+                      .join(" "),
+                  }
+                : {}),
             }, null, 2),
           };
         },
@@ -2119,6 +2835,15 @@ export async function swarmPlugin(
             if (!ok) {
               return { output: `claim: already owned / not ready` };
             }
+            // Timeline: a successful atomic claim (task.claimed). Best-effort.
+            await recordEvent(core.store, {
+              swarmId: args.swarmId,
+              type: "task.claimed",
+              actorMemberId: member.id,
+              entityType: "task",
+              entityId: args.taskId,
+              payloadJson: JSON.stringify({ memberId: member.id }),
+            });
             // Pull-claim completes the FULL working transition (design-principles
             // CP8/B1): the member is now working on this task, its currentTaskId
             // is bound, the task leaves 'claimed' for 'working', and the member is
@@ -2141,6 +2866,9 @@ export async function swarmPlugin(
             } catch (err) {
               // Kickoff failed: release the task and leave the member idle so
               // another pass can retry (mirrors scheduler.assignTask).
+              // Usage-limit detection: a kickoff failure may be a model limit
+              // hit — record it for stall diagnosis (advisory).
+              rt.stalls.recordLimitSignal(member.id, errorText(err)).catch(() => undefined);
               await core.store.releaseTask(task.id).catch(() => undefined);
               await core.store.updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: Date.now() }).catch(() => undefined);
               return { output: `claim: ok, but kickoff failed: ${(err as Error).message}` };
@@ -2169,6 +2897,15 @@ export async function swarmPlugin(
             if (!ok) {
               return { output: `release: task '${args.taskId}' could not be released (already released or terminal)` };
             }
+            // Timeline: the task returned to ready (task.released). Best-effort.
+            await recordEvent(core.store, {
+              swarmId: args.swarmId,
+              type: "task.released",
+              actorMemberId: member.id,
+              entityType: "task",
+              entityId: args.taskId,
+              payloadJson: JSON.stringify({ reason: "released via swarm_tasks" }),
+            });
             // Clear the releasing member's currentTaskId if it pointed at this
             // task (coordinator releasing someone else's task must not detach
             // itself; mirror the complete-path owner-clear logic).
@@ -2221,6 +2958,15 @@ export async function swarmPlugin(
             const tasks = await core.store.listTasks(args.swarmId);
             const task = tasks.find((t) => t.id === args.taskId);
             const oldOwnerName = oldOwnerId ? (await core.store.getMemberById(oldOwnerId))?.name : null;
+            // Timeline: atomic coordinator reassignment (task.reassigned).
+            await recordEvent(core.store, {
+              swarmId: args.swarmId,
+              type: "task.reassigned",
+              actorMemberId: caller.id,
+              entityType: "task",
+              entityId: args.taskId,
+              payloadJson: JSON.stringify({ from: oldOwnerName ?? null, to: target.name }),
+            });
             if (!swarm || !task) {
               return { output: `reassign: ok — ${args.member} now owns task ${args.taskId}${oldOwnerName ? ` (was ${oldOwnerName})` : ""}` };
             }
@@ -2231,6 +2977,9 @@ export async function swarmPlugin(
                 target.sessionId,
               );
             } catch (err) {
+              // Usage-limit detection: a kickoff failure may be a model limit
+              // hit — record it for stall diagnosis (advisory).
+              rt.stalls.recordLimitSignal(target.id, errorText(err)).catch(() => undefined);
               return { output: `reassign: ok — task ${task.id} rebound to ${args.member}${oldOwnerName ? ` (was ${oldOwnerName})` : ""}, but kickoff failed: ${(err as Error).message}` };
             }
             await rt.runScheduler(args.swarmId);
@@ -2248,6 +2997,16 @@ export async function swarmPlugin(
             }
             const targetStatus = args.action === "complete" ? "completed" : args.action === "cancel" ? "cancelled" : "failed";
             await core.store.updateTaskStatus(args.taskId, targetStatus as never);
+            // Timeline: terminal task transition (task.completed / task.failed /
+            // task.cancelled). Best-effort; never fails the action.
+            await recordEvent(core.store, {
+              swarmId: args.swarmId,
+              type: `task.${targetStatus}`,
+              actorMemberId: member.id,
+              entityType: "task",
+              entityId: args.taskId,
+              payloadJson: JSON.stringify({ memberId: member.id }),
+            });
             // X1: task reached a terminal state — clear the notified gate so a
             // future re-claim of this task can notify the coordinator again.
             rt.clearContinueNotified(args.taskId);
@@ -3065,6 +3824,11 @@ export async function swarmPlugin(
           "List the models the spawner has access to, grouped by tier, with the",
           "EXACT {providerID, modelID} values to pass into swarm_spawn members.",
           "Always copy the providerID literally — it is NOT a tier name.",
+          "You almost never need to set a model: members default to the swarm",
+          "default (opencode-go / deepseek-v4-flash, configurable via",
+          "defaultMemberModel), then the last-used model, then the coordinator's",
+          "own model. Only query this to confirm availability or pick a",
+          "SPECIFIC model for a special member.",
           "Tiers:",
           "  zen-free  - OpenCode Zen free models",
           "  zen       - OpenCode Zen paid models",
@@ -3093,6 +3857,17 @@ export async function swarmPlugin(
             byTier.set(m.tier, list);
           }
           const lines: string[] = [];
+          // Show the resolved default up front so the coordinator never has to
+          // wonder what members get when model is omitted (AUIX).
+          const def = await rt.resolveModel(rt.defaultMemberModel);
+          if (def) {
+            lines.push(`DEFAULT (used when model is omitted — config defaultMemberModel):`);
+            lines.push(`  ${def.modelID}  -> providerID: "${def.providerID}", modelID: "${def.modelID}"`);
+            lines.push("");
+          } else {
+            lines.push(`DEFAULT: configured default ${rt.defaultMemberModel.providerID}/${rt.defaultMemberModel.modelID} is NOT available here; members fall back to the last-used/coordinator model.`);
+            lines.push("");
+          }
           for (const [tier, ids] of [...byTier.entries()].sort()) {
             lines.push(`${tier.toUpperCase()} (${ids.length})`);
             for (const id of ids.sort()) lines.push(id);
@@ -3213,6 +3988,7 @@ export async function swarmPlugin(
             core.store.searchMessagesBySwarm(args.swarmId, q, 12),
           ]);
           const nameById = new Map(members.map((m) => [m.id, m.name]));
+          await enrichForeignSenderNames(core.store, msgs, nameById);
           const taskByOwner = new Map<string, string>();
           for (const t of tasks) {
             if (t.ownerMemberId && (t.status === "working" || t.status === "claimed")) taskByOwner.set(t.ownerMemberId, t.title);
@@ -3293,11 +4069,13 @@ export async function swarmPlugin(
       }),
 
       swarm_status: tool({
-        description: "Inspect swarm state: members, tasks, messages, path claims.",
+        description: "Inspect swarm state: members, tasks, messages, path claims, timeline.",
         args: {
           swarmId: tool.schema.string(),
-          detail: tool.schema.enum(["summary", "members", "tasks", "messages", "lanes", "full"]).optional(),
+          detail: tool.schema.enum(["summary", "members", "tasks", "messages", "lanes", "timeline", "full"]).optional(),
           to: tool.schema.string().optional().describe("With detail:messages, only show messages to this member (e.g. your own name) so you can read your pending queue."),
+          since: tool.schema.number().optional().describe("With detail:timeline, only events created after this epoch-ms timestamp."),
+          limit: tool.schema.number().optional().describe("With detail:timeline, max events to render (default 80)."),
         },
         async execute(args) {
           const rt = await ensureRt();
@@ -3315,6 +4093,8 @@ export async function swarmPlugin(
 
           if (args.detail === "messages") {
             let msgs = await core.store.listMessagesBySwarm(args.swarmId, 50);
+            // Cross-swarm senders (force-sent messages) resolve to `name@swarm`.
+            await enrichForeignSenderNames(core.store, msgs, nameById);
             // Optional `to` filter: only messages addressed to a given member
             // (including their pending queue), so a member can read what's for
             // them without scanning the whole stream.
@@ -3430,6 +4210,18 @@ export async function swarmPlugin(
             return { output: lines.join("\n") };
           }
 
+          if (args.detail === "timeline") {
+            // Swarm timeline / replay: the recorded event stream (swarm_event),
+            // rendered chronologically (newest last) via renderTimeline.
+            // `members` + `tasks` are already loaded above for name resolution.
+            const events = await core.store.listEvents(args.swarmId, {
+              limit: args.limit ?? 80,
+              since: args.since,
+            });
+            lines.push(renderTimeline(events, members, tasks, { limit: args.limit ?? 80 }));
+            return { output: lines.join("\n") };
+          }
+
           lines.push("MEMBERS");
           lines.push(`  ${await rt.permsDiagnosticsForSwarm(args.swarmId)}`);
           for (const m of members) {
@@ -3499,9 +4291,28 @@ export async function swarmPlugin(
           // only releases ownerless tasks (so an ownerful 'working' task would
           // dead-lock forever). Mirrors swarm_remove / session.deleted.
           if (target.currentTaskId) {
-            await core.store.releaseTask(target.currentTaskId).catch(() => undefined);
+            const releasedTaskId = target.currentTaskId;
+            await core.store.releaseTask(releasedTaskId).catch(() => undefined);
+            // Timeline: stopping a member frees its task back to the DAG.
+            await recordEvent(core.store, {
+              swarmId: args.swarmId,
+              type: "task.released",
+              actorMemberId: caller.id,
+              entityType: "task",
+              entityId: releasedTaskId,
+              payloadJson: JSON.stringify({ reason: "member stopped" }),
+            });
           }
           await core.store.updateMemberStatus(target.id, "stopped", { currentTaskId: null });
+          // Timeline: a →stopped transition (member.stopped) — the durable stop.
+          await recordEvent(core.store, {
+            swarmId: args.swarmId,
+            type: "member.stopped",
+            actorMemberId: caller.id,
+            entityType: "member",
+            entityId: target.id,
+            payloadJson: JSON.stringify({ name: target.name }),
+          });
           return { output: `stopped ${target.name}` };
         },
       }),
@@ -3634,6 +4445,691 @@ export async function swarmPlugin(
           return { output: `deleted swarm '${swarm.name}'` };
         },
       }),
+
+      swarm_list: tool({
+        description: [
+          "List every swarm in this project's store with one-line staleness flags —",
+          "the operator's 'what do I have' surface. Use swarm_revive(swarmId,",
+          "action: 'health') on any flagged swarm for full diagnostics and the",
+          "exact revive invocation. Available to any member (read-only).",
+        ].join("\n"),
+        args: {},
+        async execute() {
+          const rt = await ensureRt();
+          const engine = new ReviveEngine(rt as never);
+          const swarms = await engine.listSwarms();
+          const lines: string[] = [`SWARMS (${swarms.length})`];
+          if (swarms.length === 0) {
+            lines.push("  (none — create one with swarm_delegate)");
+            return { output: lines.join("\n") };
+          }
+          for (const s of swarms) {
+            const flags: string[] = [];
+            if (s.status !== "active") flags.push(`status=${s.status}`);
+            if (s.hasStopped) flags.push("stopped/failed members");
+            if (s.hasStuckTasks) flags.push("stuck tasks (expired lease)");
+            if (s.hasPendingPermission) flags.push("permission walls");
+            if (s.hasChatPausedMember) flags.push("chat-paused member");
+            lines.push(`  ${s.name} (${s.id})`);
+            lines.push(
+              `    project: ${s.projectId} | members: ${s.workerCount} worker(s)/${s.memberCount} total | ` +
+              `tasks: ${s.taskCounts.ready} ready, ${s.taskCounts.working} working, ${s.taskCounts.completed} completed`,
+            );
+            lines.push(flags.length ? `    STALE: ${flags.join(", ")}` : "    healthy");
+          }
+          return { output: lines.join("\n") };
+        },
+      }),
+
+      swarm_contract: tool({
+        description: [
+          "Typed blackboard contracts (JSON-schema): govern WHAT can be written to a",
+          "blackboard key. Once a contract exists for an exact key, every swarm_memory",
+          "put to that key must be valid JSON AND satisfy the contract's JSON-schema —",
+          "violating writes are rejected with a clear error, and every successful write",
+          "records a `blackboard.write` changelog event (query it via the list action).",
+          "  action 'define'  create or OVERWRITE the contract for an exact key (the new",
+          "                   schema replaces the old one). Schema must be a JSON string",
+          "                   holding a JSON-schema (supported: type, properties, required,",
+          "                   items, enum, anyOf; other keywords pass through as valid).",
+          "  action 'list'    show every contract: key, description, compact schema summary,",
+          "                   current value version, and the changelog tail (last 5 writes).",
+          "  action 'delete'  remove the contract for a key (writes become unvalidated).",
+          "define and delete are COORDINATOR-ONLY; list is available to any member.",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().describe("Swarm id or name."),
+          action: tool.schema.enum(["define", "list", "delete"]),
+          key: tool.schema.string().optional().describe("Blackboard key the contract governs (exact match). Required for define/delete."),
+          schema: tool.schema.string().optional().describe("JSON-schema as a JSON string — the value must satisfy it. Required for define."),
+          description: tool.schema.string().optional().describe("Human description of the contract."),
+          confirm: tool.schema.string().optional().describe("delete: pass the exact key to confirm."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          const swarm = await core.store.getSwarm(args.swarmId);
+          if (!swarm) return { output: `no swarm '${args.swarmId}'` };
+          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          if (!caller) return { output: "calling session is not a swarm member" };
+
+          if (args.action === "list") {
+            const contracts = await core.store.listContracts(args.swarmId);
+            if (contracts.length === 0) {
+              return {
+                output: `no contracts defined for swarm '${swarm.name}' — the coordinator can add one with swarm_contract action:'define'`,
+              };
+            }
+            const members = await core.store.listMembers(args.swarmId);
+            const nameById = new Map(members.map((m) => [m.id, m.name]));
+            const lines: string[] = [`CONTRACTS — ${swarm.name} (${contracts.length})`];
+            for (const c of contracts) {
+              let summary = "any";
+              try {
+                summary = summarizeSchema(JSON.parse(c.schemaJson) as JsonSchema);
+              } catch {
+                summary = "(unparseable schema)";
+              }
+              const entry = await core.store.getBlackboard(args.swarmId, c.keyPattern);
+              const current = entry ? `current v${entry.version}` : "no value yet";
+              const events = await core.store.listEventsForEntity(args.swarmId, "blackboard", c.keyPattern, { limit: 5 });
+              const tail = events
+                .filter((e) => e.type === "blackboard.write")
+                .map((e) => {
+                  let v = "?";
+                  try {
+                    const p = JSON.parse(e.payloadJson ?? "{}") as { version?: number };
+                    v = p.version !== undefined ? `v${p.version}` : "?";
+                  } catch { /* unparseable payload */ }
+                  const who = e.actorMemberId ? nameById.get(e.actorMemberId) ?? e.actorMemberId : "?";
+                  return `${v} by ${who}`;
+                });
+              lines.push(`  ${c.keyPattern}`);
+              lines.push(`    schema: ${summary}${c.description ? ` — ${c.description}` : ""}`);
+              lines.push(`    ${current}${tail.length ? ` | changelog: ${tail.join(", ")}` : ""}`);
+            }
+            return { output: lines.join("\n") };
+          }
+
+          // define and delete mutate contracts — coordinator-only.
+          if (caller.role !== "coordinator") {
+            return { output: `only the coordinator may ${args.action} contracts (you are '${caller.name}')` };
+          }
+
+          if (args.action === "define") {
+            if (!args.key || args.schema === undefined) {
+              return { output: "define requires key and schema (a JSON-schema as a JSON string)" };
+            }
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(args.schema);
+            } catch (err) {
+              return { output: `schema is not valid JSON: ${errorText(err)}` };
+            }
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              return { output: "schema must be a JSON object (a JSON-schema)" };
+            }
+            const now = Date.now();
+            const contract = await core.store.insertContract({
+              swarmId: args.swarmId,
+              keyPattern: args.key,
+              schemaJson: args.schema,
+              description: args.description,
+              createdBy: caller.id,
+              createdAt: now,
+              updatedAt: now,
+            });
+            const summary = summarizeSchema(parsed as JsonSchema);
+            return {
+              output: [
+                `CONTRACT DEFINED — ${contract.keyPattern}`,
+                `schema: ${summary}`,
+                contract.description ? `description: ${contract.description}` : null,
+                `writes to '${contract.keyPattern}' are now validated against this schema; every successful write records a changelog event.`,
+              ].filter((l): l is string => l !== null && l !== "").join("\n"),
+            };
+          }
+
+          if (args.action === "delete") {
+            if (!args.key) return { output: "delete requires key" };
+            if (args.confirm !== args.key) {
+              return { output: `delete REQUIRES confirm: pass the exact key '${args.key}'` };
+            }
+            const deleted = await core.store.deleteContract(args.swarmId, args.key);
+            if (!deleted) return { output: `no contract for key '${args.key}'` };
+            return { output: `CONTRACT DELETED — ${args.key}\nwrites to '${args.key}' are no longer validated.` };
+          }
+
+          return { output: `unknown action '${args.action}'` };
+        },
+      }),
+
+      swarm_revive: tool({
+        description: [
+          "Operator ↔ coordinator swarm lifecycle: revive a stalled swarm or re-task it",
+          "for a new mission. Answers the keep-vs-new decision explicitly:",
+          "  action 'health'           read-only diagnostics + the exact next invocation.",
+          "  action 'revive' + strategy 'keep'   reconcile the EXISTING swarm: respawn",
+          "                            dead sessions, release expired-lease tasks, revert",
+          "                            stale deliveries, re-kick the scheduler.",
+          "                            includeStopped:true ALSO revives deliberately-",
+          "                            stopped/failed workers.",
+          "  action 'retask' + strategy 'repoint'  keep the existing agents: cancel the old",
+          "                            mission's in-flight tasks, seed a NEW task DAG, and",
+          "                            notify the kept crew of the new mission.",
+          "  action 'retask' + strategy 'fresh'    NEW agents: stop the old workers",
+          "                            (reversible) and spawn fresh members for the new",
+          "                            mission. REQUIRES confirm = the exact swarm name.",
+          "revive/retask are COORDINATOR-ONLY (the swarm's own coordinator).",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().describe("Swarm id or name."),
+          action: tool.schema.enum(["health", "revive", "retask"]).describe("Action (default health)."),
+          strategy: tool.schema.enum(["keep", "repoint", "fresh"]).optional().describe("Required for revive (keep) and retask (repoint | fresh)."),
+          includeStopped: tool.schema.boolean().optional().describe("revive+keep: also respawn deliberately-stopped/failed workers."),
+          tasks: tool.schema.array(tool.schema.object({
+            id: tool.schema.string().optional(),
+            title: tool.schema.string(),
+            description: tool.schema.string().optional(),
+            priority: tool.schema.number().optional(),
+            dependsOn: tool.schema.array(tool.schema.string()).optional(),
+          })).optional().describe("New task DAG (retask)."),
+          members: tool.schema.array(tool.schema.object({
+            name: tool.schema.string(),
+            role: tool.schema.string(),
+            agent: tool.schema.string().optional(),
+            model: tool.schema.object({ providerID: tool.schema.string(), modelID: tool.schema.string() }).optional(),
+            taskId: tool.schema.string().optional(),
+            prompt: tool.schema.string().optional(),
+            workspace: tool.schema.enum(["shared-read", "shared-write", "worktree"]).optional(),
+          })).optional().describe("New members to spawn (retask+fresh)."),
+          prompt: tool.schema.string().optional().describe("New mission brief for kept members (retask+repoint)."),
+          confirm: tool.schema.string().optional().describe("REQUIRED for retask+fresh — pass the exact swarm name."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          const swarm = await core.store.getSwarm(args.swarmId);
+          if (!swarm) return { output: `no swarm '${args.swarmId}'` };
+          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          if (!caller) return { output: "calling session is not a swarm member" };
+          const engine = new ReviveEngine(rt as never);
+
+          if (args.action === "health") {
+            const h = await engine.health(args.swarmId);
+            const lines: string[] = [
+              `HEALTH — ${h.swarmName} (${h.swarmId})`,
+              `status: ${h.status} | verdict: ${h.verdict.toUpperCase()}`,
+              "",
+              "MEMBERS:",
+              ...h.members.map((m) =>
+                `  ${m.name} (${m.role}) — ${m.status}${m.humanChatPaused ? " [chat-paused]" : ""}${m.pendingPermissions > 0 ? ` [${m.pendingPermissions} permission wall(s)]` : ""}${m.needsRespawn ? " [needs respawn]" : ""}${m.currentTaskTitle ? ` — task: ${m.currentTaskTitle}` : ""} (model: ${m.model})`,
+              ),
+              "",
+              `TASKS: ${h.tasks.ready} ready, ${h.tasks.working} working, ${h.tasks.stuck} stuck (expired lease), ${h.tasks.completed} completed, ${h.tasks.cancelled} cancelled, ${h.tasks.failed} failed, ${h.tasks.other} other`,
+            ];
+            if (h.stuckTasks.length) {
+              lines.push("STUCK TASKS:");
+              for (const t of h.stuckTasks) {
+                lines.push(`  ${t.id} '${t.title}' (${t.status}) owner=${t.owner}${t.reservedFor ? ` reserved-for=${t.reservedFor}` : ""}`);
+              }
+            }
+            if (h.pendingPermissions.length) {
+              lines.push("PENDING PERMISSIONS (members blocked):");
+              for (const p of h.pendingPermissions) {
+                lines.push(`  ${p.memberName} — ${p.type}${p.pattern ? ` ${fence(p.pattern)}` : ""}`);
+              }
+            }
+            if (h.staleScheduled > 0) lines.push(`STALE DELIVERIES: ${h.staleScheduled} scheduled message(s) never confirmed`);
+            lines.push("", `NEXT: ${h.recommended}`);
+            return { output: lines.join("\n") };
+          }
+
+          // Mutating actions are coordinator-only.
+          if (caller.role !== "coordinator") {
+            return { output: `only the coordinator may run swarm_revive actions (you are '${caller.name}')` };
+          }
+
+          if (args.action === "revive") {
+            if (args.strategy !== "keep") {
+              return { output: "revive requires strategy: 'keep' (reconcile the existing swarm)" };
+            }
+            const r = await engine.reviveKeep(args.swarmId, { includeStopped: args.includeStopped });
+            const lines: string[] = [
+              `REVIVED — ${swarm.name} (${r.swarmId})`,
+              `swarm status: ${r.swarmStatus}`,
+            ];
+            for (const m of r.recoveredMembers) {
+              lines.push(`  ${m.name}: ${m.action}${m.detail ? ` — ${m.detail}` : ""}`);
+            }
+            lines.push(
+              `released stuck tasks: ${r.releasedStuckTasks}`,
+              `stale deliveries reverted: ${r.staleScheduledReverted}`,
+              `stopped workers revived: ${r.includeStoppedRevived}`,
+              `scheduler: ${r.schedulerKicked ? "kicked — ready tasks are being assigned" : "not kicked"}`,
+            );
+            return { output: lines.join("\n") };
+          }
+
+          if (args.action === "retask") {
+            if (args.strategy !== "repoint" && args.strategy !== "fresh") {
+              return { output: "retask requires strategy: 'repoint' (keep agents) or 'fresh' (new agents)" };
+            }
+            if (args.strategy === "fresh") {
+              if (!args.confirm) {
+                return { output: `retask+fresh REQUIRES confirm: pass the exact swarm name '${swarm.name}' to stop the old agents and spawn new ones` };
+              }
+              if (args.confirm !== swarm.name) {
+                return { output: `confirm mismatch: pass the exact swarm name '${swarm.name}' to proceed` };
+              }
+            }
+            const r = await engine.retask(args.swarmId, args.strategy, {
+              tasks: args.tasks as never,
+              members: args.members as never,
+              prompt: args.prompt,
+            });
+            const lines: string[] = [
+              `RE-TASKED — ${swarm.name} (${r.swarmId}) strategy=${r.strategy}`,
+              `cancelled old in-flight tasks: ${r.cancelledTasks}`,
+              `seeded new tasks: ${r.seededTasks}`,
+            ];
+            if (r.strategy === "fresh") {
+              lines.push(`stopped old workers: ${r.stoppedOldMembers}`);
+              for (const s of r.spawnedMembers) {
+                lines.push(`  spawned ${s.name} — model ${s.model ? `${s.model.providerID}/${s.model.modelID}` : "default"} (${s.modelSource})`);
+              }
+            } else {
+              lines.push(`crew notified of new mission: ${r.notifiedMembers}`);
+            }
+            lines.push(`scheduler: ${r.schedulerKicked ? "kicked" : "not kicked"}`, r.note ?? "");
+            return { output: lines.join("\n") };
+          }
+
+          return { output: `unknown action '${args.action}'` };
+        },
+      }),
+
+      swarm_emergency: tool({
+        description: [
+          "Emergency kill switch — halt runaway swarm activity INSTANTLY. Operates on the",
+          "WHOLE store (every swarm), not one swarm. Three layers, escalating:",
+          "  freeze   pause every swarm; scheduler goes no-op; spawns/delegates refuse;",
+          "           message delivery halts (mail stays queued, resumes after clear).",
+          "  stop     freeze + stop every worker member + cancel every non-terminal task.",
+          "           REQUIRES confirm 'STOP ALL'.",
+          "  nuke     DELETE ALL SWARMS. REQUIRES confirm 'NUKE ALL'. IRREVERSIBLE.",
+          "Automatic tripwires (spawn/message/task rate + member cap) freeze the system",
+          "without a human and notify every coordinator with an [EMERGENCY] header.",
+          "status: any member may inspect (tripped?, level, since, by, reason, tripwire",
+          "config, affected counts). trip/clear are OPERATOR-GATED: the caller must be a",
+          "coordinator of some swarm (or the runtime is headless — trip requires reason).",
+          "clear REQUIRES confirm \"I CONFIRM RESUME\" (exact) and resumes all paused swarms.",
+          "The coordinator's own session is NEVER touched — machinery freezes, chats stay.",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().optional().describe("Ignored — the kill switch operates on the whole store. Accepted for tool-shape consistency."),
+          action: tool.schema.enum(["status", "trip", "clear"]).describe("status: read-only inspection. trip: freeze/stop/nuke (operator-gated). clear: resume (exact confirm)."),
+          level: tool.schema.enum(["freeze", "stop", "nuke"]).optional().describe("Trip level (default freeze)."),
+          confirm: tool.schema.string().optional().describe("Required for stop ('STOP ALL'), nuke ('NUKE ALL'), and clear ('I CONFIRM RESUME')."),
+          reason: tool.schema.string().optional().describe("Why the trip happened (required for headless-runtime trips; recommended for operator trips)."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          const guard = rt.emergency;
+
+          if (args.action === "status") {
+            const state = guard.state;
+            const swarmIds = await core.store.listAllMemberSwarmIds();
+            let memberCount = 0;
+            let taskCount = 0;
+            for (const id of swarmIds) {
+              memberCount += (await core.store.listMembers(id)).length;
+              taskCount += (await core.store.listTasks(id)).length;
+            }
+            const age = state.trippedAt ? Math.round((Date.now() - state.trippedAt) / 1000) : 0;
+            const lines = [
+              state.tripped
+                ? `EMERGENCY — ${String(state.level).toUpperCase()} TRIPPED`
+                : "EMERGENCY — ALL CLEAR",
+              ...(state.tripped
+                ? [
+                    `level: ${state.level}`,
+                    `since: ${new Date(state.trippedAt!).toISOString()} (${age}s ago)`,
+                    `tripped by: ${state.trippedBy}`,
+                    ...(state.reason ? [`reason: ${state.reason}`] : []),
+                  ]
+                : []),
+              "TRIPWIRES:",
+              `  maxSpawnsPerMin: ${state.tripwires.maxSpawnsPerMin}`,
+              `  maxMessagesPerMin: ${state.tripwires.maxMessagesPerMin}`,
+              `  maxMembers: ${state.tripwires.maxMembers}`,
+              `  maxTasksPerMin: ${state.tripwires.maxTasksPerMin}`,
+              "AFFECTED:",
+              `  swarms: ${swarmIds.length}`,
+              `  members: ${memberCount}`,
+              `  tasks: ${taskCount}`,
+              ...(state.tripped
+                ? [
+                    "",
+                    `clear: swarm_emergency(action: 'clear', confirm: "${CONFIRM_CLEAR}")`,
+                  ]
+                : []),
+            ];
+            return { output: lines.join("\n") };
+          }
+
+          // trip / clear are operator-gated: the caller must be a coordinator
+          // of SOME swarm, or the runtime is headless (no member rows).
+          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          const memberRows = await rt.countAllMembers();
+          const isCoordinator = !!caller && caller.role === "coordinator";
+          const headless = memberRows === 0;
+          if (!isCoordinator && !headless) {
+            return { output: `swarm_emergency trip/clear is operator-gated: you must be a coordinator of some swarm (you are '${caller?.name ?? "not a member"}')` };
+          }
+          if (headless && !args.reason) {
+            return { output: "headless runtime: trip requires reason (no coordinator session exists to review it)" };
+          }
+
+          if (args.action === "clear") {
+            if (args.confirm !== CONFIRM_CLEAR) {
+              return { output: `clear REQUIRES confirm: pass the EXACT string "${CONFIRM_CLEAR}"` };
+            }
+            const resumed = await rt.emergencyClear();
+            return {
+              output: `EMERGENCY CLEARED — resumed ${resumed} paused swarm(s); spawns/delegates/scheduler/messaging are live again`,
+            };
+          }
+
+          // action === "trip"
+          const level = args.level ?? "freeze";
+          const by = caller?.name ?? "operator(headless)";
+          if (level === "stop" && args.confirm !== CONFIRM_STOP) {
+            return { output: `stop REQUIRES confirm: pass the EXACT string "${CONFIRM_STOP}"` };
+          }
+          if (level === "nuke" && args.confirm !== CONFIRM_NUKE) {
+            return { output: `nuke REQUIRES confirm: pass the EXACT string "${CONFIRM_NUKE}" — IRREVERSIBLE (deletes ALL swarms)` };
+          }
+          await guard.trip(level, by, args.reason);
+          if (level === "stop") {
+            const r = await rt.emergencyStop();
+            return { output: `EMERGENCY STOPPED (stop) — paused ${r.paused} swarm(s), stopped ${r.stopped} worker(s), cancelled ${r.cancelled} task(s). clear: swarm_emergency(action: 'clear', confirm: "${CONFIRM_CLEAR}")` };
+          }
+          if (level === "nuke") {
+            const n = await rt.emergencyNuke();
+            return { output: `EMERGENCY NUKED — deleted ${n} swarm(s). IRREVERSIBLE. clear: swarm_emergency(action: 'clear', confirm: "${CONFIRM_CLEAR}")` };
+          }
+          const paused = await rt.emergencyFreeze();
+          return { output: `EMERGENCY FROZEN — paused ${paused} swarm(s); scheduler/messaging halted. clear: swarm_emergency(action: 'clear', confirm: "${CONFIRM_CLEAR}")` };
+        },
+      }),
+
+      swarm_permissions: tool({
+        description: [
+          "Inspect and answer member permission stalls (permission-stall escalation).",
+          "When a member's permission.ask prompt stays 'ask' (not auto-allowed), the member is",
+          "blocked on the prompt and cannot proceed. list shows every pending prompt with the",
+          "exact reply recipe; reply answers one prompt (once/always/reject) so the member's",
+          "session is unblocked immediately.",
+          "list is available to any swarm member; reply is COORDINATOR-ONLY (the authority that",
+          "spawned the member decides what it may do).",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().describe("Swarm id."),
+          action: tool.schema.enum(["list", "reply"]).describe("Action."),
+          permissionId: tool.schema.string().optional().describe("Required for reply — the pending permission id."),
+          response: tool.schema.enum(["once", "always", "reject"]).optional().describe("Required for reply — the verdict to send to the member's session."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          if (!caller) return { output: "calling session is not a swarm member" };
+
+          if (args.action === "list") {
+            const pending = await core.store.listPendingPermissions(args.swarmId);
+            if (pending.length === 0) {
+              return { output: "(none — no members are stuck on permission prompts)" };
+            }
+            const members = await core.store.listMembers(args.swarmId);
+            const nameById = new Map(members.map((m) => [m.id, m.name]));
+            const now = Date.now();
+            const lines = pending.map((p, i) => {
+              const age = Math.max(0, Math.round((now - p.createdAt) / 1000));
+              const patternText = p.pattern ?? p.title ?? "";
+              const name = nameById.get(p.memberId) ?? p.memberId;
+              return (
+                `${i + 1}. member '${name}' — ${p.type}: ${patternText ? fence(patternText) : "(no pattern)"}\n` +
+                `   permission id: ${p.id}\n` +
+                `   age: ${age}s\n` +
+                `   answer: swarm_permissions(swarmId: '${args.swarmId}', action: 'reply', permissionId: '${p.id}', response: 'once' | 'always' | 'reject')`
+              );
+            });
+            return { output: `${pending.length} member(s) blocked on permission prompts:\n${lines.join("\n")}` };
+          }
+
+          // action === "reply" — coordinator of THIS swarm only (the authority
+          // for the member's work; a worker or a foreign coordinator gets a
+          // clear rejection, mirroring the destructive-op safety pattern).
+          if (caller.role !== "coordinator") {
+            return { output: `swarm_permissions reply is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
+          }
+          if (caller.swarmId !== args.swarmId) {
+            return { output: `only the coordinator of this swarm may answer its permission prompts (you coordinate '${caller.swarmId}')` };
+          }
+          if (!args.permissionId) return { output: "reply requires permissionId" };
+          if (!args.response) return { output: "reply requires response ('once' | 'always' | 'reject')" };
+
+          const rec = await core.store.getPendingPermission(args.swarmId, args.permissionId);
+          if (!rec) {
+            return { output: `no pending permission '${args.permissionId}' in this swarm (already answered?)` };
+          }
+          const ok = await rt.replyPermission(rec.sessionId, args.permissionId, args.response);
+          if (ok) {
+            await core.store.respondToPermission(args.permissionId, args.response);
+            const member = await core.store.getMemberById(rec.memberId);
+            return {
+              output: `answered '${args.response}' for member '${member?.name ?? rec.memberId}' — their session is unblocked; if they do not resume, use swarm_wake`,
+            };
+          }
+          await core.store.markPermissionReplied(args.permissionId, "expired");
+          return { output: "the prompt is already gone (answered or expired); nothing to answer" };
+        },
+      }),
+
+      swarm_stalls: tool({
+        description: [
+          "Stall auto-diagnosis + escalation ladder (the ONE 'why is my swarm stuck' answer).",
+          "Unifies the watchdog (silent sessions), permission walls, expired task leases,",
+          "and model usage-limit hits into one per-member classifier.",
+          "  action 'report'  read-only: swarm verdict (healthy|stalled), per-member",
+          "                   diagnosis (reason, stallMs, evidence, next ladder action)",
+          "                   with the EXACT resolving recipe, plus recorded usage-limit hits.",
+          "  action 'ladder'  COORDINATOR-ONLY: force-advance a named member ONE rung",
+          "                   now (nudge -> permission/usage notify -> coordinator blocker",
+          "                   -> release-task / respawn), bypassing time + dedup windows.",
+          "report is available to any swarm member; ladder is coordinator-only.",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().describe("Swarm id or name."),
+          action: tool.schema.enum(["report", "ladder"]).optional().describe("Action (default report)."),
+          member: tool.schema.string().optional().describe("Required for ladder — the member name to force-advance one rung."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          if (!caller) return { output: "calling session is not a swarm member" };
+          const swarm = await core.store.getSwarm(args.swarmId);
+          if (!swarm) return { output: `no swarm '${args.swarmId}'` };
+
+          if (!args.action || args.action === "report") {
+            const report = await rt.stalls.diagnose(args.swarmId);
+            const limits = await rt.stalls.reportLimits(args.swarmId);
+            const lines: string[] = [
+              `STALL REPORT — ${swarm.name} (${swarm.id})`,
+              `verdict: ${report.verdict.toUpperCase()}${report.causes.length ? ` | causes: ${report.causes.join(", ")}` : ""}`,
+              "",
+              "MEMBERS:",
+            ];
+            for (const d of report.members) {
+              const stalled = d.nextAction !== "none";
+              lines.push(
+                `  ${d.memberName} (${d.role}) — ${d.status} — ${d.reason}${d.stallMs > 0 ? ` (stalled ~${Math.round(d.stallMs / 1000)}s)` : ""} — next: ${d.nextAction}`,
+              );
+              for (const e of d.evidence) lines.push(`      evidence: ${e}`);
+              if (stalled) lines.push(`      resolve: ${d.recipe}`);
+            }
+            if (limits.length > 0) {
+              lines.push("", "USAGE LIMITS (model limit hits):");
+              for (const l of limits) {
+                lines.push(`  ${l.memberName} — ${fence(l.signal)} (${new Date(l.at).toISOString()}) — ${l.remedy}`);
+              }
+            }
+            lines.push("", `NEXT: ${report.recommended}`);
+            return { output: lines.join("\n") };
+          }
+
+          // action === "ladder" — coordinator of THIS swarm only.
+          if (caller.role !== "coordinator") {
+            return { output: `swarm_stalls ladder is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
+          }
+          if (caller.swarmId !== args.swarmId) {
+            return { output: `only the coordinator of this swarm may advance its members (you coordinate '${caller.swarmId}')` };
+          }
+          if (!args.member) return { output: "ladder requires 'member' (the member name to advance one rung)" };
+          try {
+            const d = await rt.stalls.forceAdvance(args.swarmId, args.member);
+            return {
+              output: d.nextAction === "none"
+                ? `member '${args.member}' is not stalled (reason ${d.reason}) — nothing to advance`
+                : `advanced '${args.member}' one rung: reason=${d.reason} → action ${d.nextAction}\nrecipe: ${d.recipe}`,
+            };
+          } catch (err) {
+            return { output: `ladder advance failed: ${(err as Error).message}` };
+          }
+        },
+      }),
+
+      swarm_deliverables: tool({
+        description: [
+          "Handoff receipt ledger: read a swarm's deliverables (auto-recorded from every",
+          "kind:'handoff' message) and let the coordinator attach verdicts.",
+          "list renders each deliverable with its verdict (or OPEN), age, author, task,",
+          "fenced summary, refs, and artifact files. Any swarm member may read ANY",
+          "swarm's ledger by passing that swarm's id or name — the cross-swarm",
+          "deliverable bus (read-only): other swarms can read this swarm's ledger the",
+          "same way, so handoffs are visible across swarms without cross-swarm writes.",
+          "verdict accepts/rejects one OPEN deliverable and is COORDINATOR-ONLY — the",
+          "coordinator of the deliverable's OWN swarm (a worker or a foreign",
+          "coordinator gets a clear rejection). Verdicts are recorded in the swarm",
+          "event stream (deliverable.verdict) so the timeline reflects them.",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().describe("Swarm id or name (may be ANOTHER swarm — cross-swarm read of its ledger)."),
+          action: tool.schema.enum(["list", "verdict"]).describe("Action."),
+          verdict: tool.schema.enum(["accepted", "rejected"]).optional().describe("Required for verdict — the verdict to record."),
+          member: tool.schema.string().optional().describe("Filter list to deliverables authored by this member name."),
+          taskId: tool.schema.string().optional().describe("Filter list to deliverables for this task."),
+          limit: tool.schema.number().optional().describe("Max rows to list (default 50)."),
+          deliverableId: tool.schema.string().optional().describe("Required for verdict — the deliverable id."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          if (!caller) return { output: "calling session is not a swarm member" };
+
+          // list — any member may read ANY swarm's ledger (cross-swarm
+          // deliverable bus). The caller must be a registered member of SOME
+          // swarm; the target swarm is whatever swarmId was passed.
+          if (args.action === "list") {
+            // The member filter resolves by NAME inside the target swarm.
+            let memberId: string | undefined;
+            if (args.member) {
+              const members = await core.store.listMembers(args.swarmId);
+              const hit = members.find((m) => m.name.toLowerCase() === args.member!.toLowerCase());
+              if (!hit) return { output: `(none — no member '${args.member}' in this swarm)` };
+              memberId = hit.id;
+            }
+            const rows = await core.store.listDeliverables(args.swarmId, {
+              ...(args.verdict ? { verdict: args.verdict } : {}),
+              ...(memberId ? { memberId } : {}),
+              ...(args.taskId ? { taskId: args.taskId } : {}),
+              limit: args.limit ?? 50,
+            });
+            if (rows.length === 0) return { output: "(none — no deliverables recorded yet)" };
+            const [swarm, members, tasks] = await Promise.all([
+              core.store.getSwarm(args.swarmId),
+              core.store.listMembers(args.swarmId),
+              core.store.listTasks(args.swarmId),
+            ]);
+            const nameById = new Map(members.map((m) => [m.id, m.name]));
+            const taskTitleById = new Map(tasks.map((t) => [t.id, t.title]));
+            const now = Date.now();
+            const lines = rows.map((d, i) => {
+              const age = Math.max(0, Math.round((now - d.createdAt) / 1000));
+              const author = nameById.get(d.memberId) ?? d.memberId;
+              const taskTitle = d.taskId ? (taskTitleById.get(d.taskId) ?? d.taskId) : "(none)";
+              const refsText = d.refs?.length ? d.refs.join(", ") : "(none)";
+              const filesText = d.files?.length ? d.files.join(", ") : "(none)";
+              return (
+                `#${i + 1} [${d.verdict ?? "OPEN"}] (${age}s) by ${author} — task: ${taskTitle}\n` +
+                `   summary: ${fence(d.summary)}\n` +
+                `   refs: ${refsText}\n` +
+                `   files: ${filesText}\n` +
+                `   id: ${d.id}`
+              );
+            });
+            return { output: `${swarm?.name ?? args.swarmId} deliverable ledger (${rows.length}):\n${lines.join("\n")}` };
+          }
+
+          // action === "verdict" — coordinator OF THE DELIVERABLE'S SWARM only
+          // (the authority for the member's work; a worker or a foreign
+          // coordinator gets a clear rejection, mirroring swarm_permissions).
+          if (caller.role !== "coordinator") {
+            return { output: `swarm_deliverables verdict is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
+          }
+          if (caller.swarmId !== args.swarmId) {
+            return { output: `only the coordinator of this swarm may verdict its deliverables (you coordinate '${caller.swarmId}')` };
+          }
+          if (!args.deliverableId) return { output: "verdict requires deliverableId" };
+          if (!args.verdict) return { output: "verdict requires verdict ('accepted' | 'rejected')" };
+
+          const dlv = await core.store.getDeliverable(args.deliverableId);
+          if (!dlv) return { output: `no deliverable '${args.deliverableId}' in the ledger` };
+          if (dlv.swarmId !== args.swarmId) {
+            return { output: `deliverable '${args.deliverableId}' belongs to a different swarm — only its own coordinator may verdict it` };
+          }
+          const applied = await core.store.setDeliverableVerdict(args.deliverableId, args.verdict, caller.id);
+          if (!applied) {
+            return { output: `deliverable '${args.deliverableId}' already has a verdict (${dlv.verdict}) — verdicts are final` };
+          }
+          // Verdict recording: append to the swarm event stream (timeline) so
+          // the ledger decision is replayable, not just a column flip.
+          await core.store.insertEvent({
+            swarmId: args.swarmId,
+            type: "deliverable.verdict",
+            actorMemberId: caller.id,
+            entityType: "deliverable",
+            entityId: dlv.id,
+            payloadJson: JSON.stringify({ verdict: args.verdict }),
+            createdAt: Date.now(),
+          }).catch((err) => {
+            console.warn(`[swarm] deliverable verdict event recording failed: ${(err as Error).message}`);
+          });
+          const author = (await core.store.getMemberById(dlv.memberId))?.name ?? dlv.memberId;
+          return {
+            output: `deliverable ${args.verdict} — recorded in the ledger (${author}'s ${dlv.taskId ? `handoff for '${dlv.taskId}'` : "handoff"})`,
+          };
+        },
+      }),
     },
 
     event: async ({ event }) => {
@@ -3651,6 +5147,44 @@ export async function swarmPlugin(
       // on external_directory / bash prompts for the project they were told to
       // build.
       await autoAllowSwarmPermission(rt, input, output);
+      // Permission-stall escalation: when a MEMBER's prompt stays "ask" (not
+      // auto-allowed), record it as pending and notify the swarm coordinator
+      // IMMEDIATELY (deduped per permission id) so the headless member never
+      // waits forever on an unanswered prompt. Coordinator prompts still go to
+      // the user and are NOT recorded here.
+      if (output.status === "ask") {
+        try {
+          const member = await rt.store.getMemberBySessionId(input.sessionID);
+          if (member && member.role !== "coordinator" && input.id) {
+            const p: PendingPermission = {
+              id: input.id,
+              swarmId: member.swarmId,
+              memberId: member.id,
+              sessionId: input.sessionID,
+              type: input.type,
+              pattern: Array.isArray(input.pattern) ? input.pattern.join(", ") : input.pattern,
+              title: input.title,
+              response: null,
+              respondedAt: null,
+              createdAt: Date.now(),
+            };
+            await rt.store.insertPendingPermission(p);
+            await rt.notifyPermissionPrompt(p);
+            // Timeline: the member hit a permission wall (permission.asked).
+            // Best-effort; never fails the escalation path.
+            await recordEvent(rt.store, {
+              swarmId: member.swarmId,
+              type: "permission.asked",
+              actorMemberId: member.id,
+              entityType: "permission",
+              entityId: p.id,
+              payloadJson: JSON.stringify({ memberId: member.id, type: p.type }),
+            });
+          }
+        } catch (err) {
+          console.error(`[swarm] permission-stall escalation failed:`, err);
+        }
+      }
     },
 
     "chat.message": async (input, output) => {
@@ -3683,6 +5217,20 @@ export async function handleOpenCodeEvent(
   event: { type: string; properties?: Record<string, unknown> },
 ): Promise<void> {
   const { supervisor, broker, store, core } = rt;
+
+  // Permission bookkeeping: when the USER answers a permission prompt in the
+  // app (permission.replied event), mark the recorded pending prompt replied so
+  // it stops appearing in swarm_permissions list (the member is unblocked —
+  // the prompt never becomes a stale "stuck" entry). Best-effort; a missing row
+  // (prompt never recorded via permission.ask) is a no-op.
+  if (event.type === "permission.replied") {
+    const permissionID = (event.properties as { permissionID?: string })?.permissionID;
+    if (permissionID) {
+      await store.markPermissionReplied(permissionID, String((event.properties as { response?: unknown })?.response ?? "replied")).catch((err) => {
+        console.error(`[swarm] permission.replied bookkeeping failed:`, err);
+      });
+    }
+  }
 
   // Members that already received a mailbox delivery this event (they were
   // re-engaged by the inbox prompt; no separate continue prompt needed).
