@@ -54,6 +54,44 @@ export interface OpenCodeClientLike {
   app?: {
     agents(options?: any): Promise<any>;
   };
+  /**
+   * The V2 (headless server) client surface (t-perm-lifecycle). The v1-gen
+   * `input.client` exposes NO `.v2` surface — the plugin constructs a second
+   * client via `createOpencodeClient` from `@opencode-ai/sdk/v2` with
+   * `baseUrl: input.serverUrl` and hands it here. All V2 permission lifecycle
+   * work goes through this surface:
+   *   - `v2.event`          SSE GET /api/event (permission.v2.asked/replied,
+   *                         session.next.moved — NO location filter)
+   *   - `v2.permission.request.list()` GET /api/permission/request (polling backstop)
+   *   - `session.permission.list({sessionID})` GET /api/session/{id}/permission
+   *   - `session.permission.reply(...)`       POST /api/session/{id}/permission/{requestID}/reply
+   */
+  v2?: OpenCodeClientLikeV2;
+}
+
+/** Structural shape of the v2 SDK client (createOpencodeClient from
+ * @opencode-ai/sdk/v2). Kept structural so the runtime never imports the SDK. */
+export interface OpenCodeClientLikeV2 {
+  event?: {
+    /** SSE GET /api/event — returns { stream: AsyncGenerator<EventV2> }. */
+    subscribe(options?: any): Promise<any>;
+  };
+  session?: {
+    permission?: {
+      /** GET /api/session/{sessionID}/permission. */
+      list(options: any): Promise<any>;
+      /** POST /api/session/{sessionID}/permission/{requestID}/reply. */
+      reply(options: any): Promise<any>;
+    };
+  };
+  v2?: {
+    permission?: {
+      request?: {
+        /** GET /api/permission/request. */
+        list(options?: any): Promise<any>;
+      };
+    };
+  };
 }
 
 /** The permission ruleset for an agent: tool-level allow/ask/deny + bash
@@ -80,6 +118,7 @@ export class OpenCodeRuntime implements AgentRuntime {
     private workspace?: string,
     private coordinatorSessionId?: string,
     private coordinatorAgent = "build",
+    private v2?: OpenCodeClientLikeV2,
   ) {
     this.client = client;
   }
@@ -368,6 +407,95 @@ export class OpenCodeRuntime implements AgentRuntime {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Answer a V2-engine permission request (t-perm-lifecycle). Posts to the v2
+   * endpoint POST /api/session/{sessionID}/permission/{requestID}/reply with
+   * body { reply }. The V1 postSessionIdPermissionsPermissionId endpoint only
+   * works for V1-engine asks, so V2 records MUST route here. Returns TRUE on
+   * success; FALSE (never throws) when the v2 client is absent, the call
+   * throws, or the response carries an error (404 = already answered/expired).
+   */
+  async replyPermissionV2(sessionID: string, requestID: string, response: "once" | "always" | "reject"): Promise<boolean> {
+    const reply = this.v2?.session?.permission?.reply;
+    if (!reply) return false;
+    try {
+      const res = await reply({
+        path: { sessionID, requestID },
+        body: { reply: response },
+      });
+      if ((res as any)?.error) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * V2 polling backstop: GET /api/permission/request — every pending permission
+   * request for the plugin's location, regardless of how the plugin learned
+   * about it. Returns [] when the v2 client is absent or the call fails
+   * (never throws). The payload shape is defensive: { requests: [...] } or a
+   * bare array, each item { id, sessionID, action, resources, ... }.
+   */
+  async listV2PermissionRequests(): Promise<Array<Record<string, unknown>>> {
+    const req = this.v2?.v2?.permission?.request?.list;
+    if (!req) return [];
+    try {
+      const res = await req({});
+      const data = (res as any)?.data;
+      if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
+      if (Array.isArray((data as any)?.requests)) return (data as any).requests as Array<Record<string, unknown>>;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * V2 polling backstop: GET /api/session/{sessionID}/permission — pending
+   * permission requests owned by one session. Returns [] on any failure
+   * (never throws).
+   */
+  async listV2SessionPermissionRequests(sessionID: string): Promise<Array<Record<string, unknown>>> {
+    const list = this.v2?.session?.permission?.list;
+    if (!list) return [];
+    try {
+      const res = await list({ path: { sessionID } });
+      const data = (res as any)?.data;
+      if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
+      if (Array.isArray((data as any)?.requests)) return (data as any).requests as Array<Record<string, unknown>>;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Whether a V2 (headless-server) client surface was provided. Guards the
+   * plugin's polling backstop and SSE subscription (t-perm-lifecycle). */
+  get hasV2Client(): boolean {
+    return !!this.v2;
+  }
+
+  /**
+   * V2 SSE subscription (t-perm-lifecycle): subscribe to client.v2.event
+   * (GET /api/event). Returns the async generator of parsed event objects
+   * ({ id, type, properties }) or undefined when the v2 client is absent.
+   * The caller owns draining/reconnect; the runtime never throws here. An
+   * optional signal aborts the underlying connection (used on plugin dispose).
+   */
+  async v2EventStream(signal?: AbortSignal): Promise<AsyncGenerator<Record<string, unknown>> | undefined> {
+    const subscribe = this.v2?.event?.subscribe;
+    if (!subscribe) return undefined;
+    try {
+      const res = await subscribe({ ...(signal ? { signal } : {}) });
+      const stream = (res as any)?.stream;
+      if (!stream || typeof stream[Symbol.asyncIterator] !== "function") return undefined;
+      return stream as AsyncGenerator<Record<string, unknown>>;
+    } catch {
+      return undefined;
     }
   }
 

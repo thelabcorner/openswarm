@@ -6,7 +6,7 @@ import type { SwarmStore } from "./storage/store.js";
 import { SQLiteStore } from "./storage/sqlite-store.js";
 import { ChunkDbStore } from "./storage/chunkdb-store.js";
 import { migrateSwarmDb } from "./storage/migrate.js";
-import { OpenCodeRuntime } from "./runtime/opencode-runtime.js";
+import { OpenCodeRuntime, type OpenCodeClientLikeV2 } from "./runtime/opencode-runtime.js";
 import { SwarmCore, BlackboardConflict, swarmTaskLeaseMs, detectAckReply } from "./core/swarm.js";
 import { Supervisor } from "./supervisor/supervisor.js";
 import { Recovery } from "./supervisor/recovery.js";
@@ -40,6 +40,26 @@ import type { PendingPermission, Swarm, SwarmMember, SwarmMessage } from "./core
 /** Max times a member is auto-continued after an idle turn before the plugin
  * gives up and surfaces the member to the coordinator as stuck. */
 const MAX_CONTINUE_ATTEMPTS = 12;
+
+/** Event types the plugin reduces from the V2 SSE stream (client.v2.event,
+ * GET /api/event) in addition to the plugin event hook (t-perm-lifecycle).
+ * V2 asks never fire the permission.ask hook and permission.v2.* events carry
+ * no event-level location (so the location-filtered hook would drop them);
+ * session.next.moved is the session re-root surface. The V1 pair is kept so
+ * a legacy emitter (or the hook path) reduces through the same code. */
+const PERMISSION_LIFECYCLE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "permission.asked",
+  "permission.replied",
+  "permission.v2.asked",
+  "permission.v2.replied",
+  "session.next.moved",
+]);
+
+/** Polling-backstop throttle (t-perm-lifecycle): at most one poll of the
+ * server's pending-ask GET endpoints per member session per window, so a
+ * diagnose pass can never hammer the server (the 10s stall sweep is the
+ * natural cadence; this bounds faster manual diagnose calls). */
+const PERM_POLL_THROTTLE_MS = 5_000;
 
 /** Truncate long blackboard values in list/search output so the tool stays
  * readable while still surfacing content (premium UX: a member can see what a
@@ -368,6 +388,14 @@ export interface SwarmPluginOptions {
    * When 'chunkdb' is selected and no chunkdb file exists yet but a legacy
    * swarms.db does, the sqlite data is migrated automatically on startup. */
   storeBackend?: "sqlite" | "chunkdb";
+  /** Optional injected V2 (headless-server) client surface (t-perm-lifecycle).
+   * Tests inject a fake here; production builds the real client from
+   * input.serverUrl via @opencode-ai/sdk/v2. When absent, V2 permission
+   * events/polling/replies degrade gracefully (V1 engine still works). */
+  v2Client?: OpenCodeClientLikeV2;
+  /** When false, skip the client.v2.event (SSE /api/event) subscription
+   * (tests set this to avoid network sockets). Default true. */
+  subscribeV2Events?: boolean;
 }
 
 /** Model used for spawned members when nothing more specific is known. */
@@ -452,6 +480,10 @@ export class SwarmPluginRuntime implements StallHost {
    * advisories — ONE advisory per ask id, never more (a re-raise of the same
    * ask must not re-notify). */
   private allowAllAdvisedIds = new Set<string>();
+  /** t-perm-lifecycle polling backstop: per-member-session last poll time (ms).
+   * The stall diagnoser polls the server's pending-ask GET endpoints at most
+   * once per session per window so a diagnose pass can never hammer the server. */
+  private permPollAt = new Map<string, number>();
   /** The default member model (config `defaultMemberModel`). */
   readonly defaultMemberModel: { providerID: string; modelID: string };
 
@@ -581,6 +613,62 @@ export class SwarmPluginRuntime implements StallHost {
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.sweepTimer = undefined;
     this.recoveryTimer = undefined;
+    // Stop the v2 SSE lifecycle subscription (t-perm-lifecycle): flag the loop
+    // and abort the in-flight SSE connection.
+    this.v2EventLoopStopped = true;
+    this.v2EventAbort.abort();
+  }
+
+  // ==== V2 permission lifecycle SSE subscription (t-perm-lifecycle) ====
+  //
+  // The plugin event hook receives V2 events filtered by event-level location
+  // (the server drops events whose location doesn't match the plugin's
+  // directory — permission.v2.asked has no event-level location, so the hook
+  // never sees it). The headless SSE GET /api/event (client.v2.event) has NO
+  // filter and carries every event, so the plugin subscribes to it directly
+  // and reduces the permission-lifecycle subset through the same path as the
+  // hook. Idempotent reduction (INSERT OR REPLACE + deduped coordinator
+  // notify) makes double-processing harmless. Never throws; reconnects with
+  // exponential backoff; stopped by dispose().
+  private v2EventLoopActive = false;
+  private v2EventLoopStopped = false;
+  /** Aborts the v2 SSE connection on dispose (the generated SSE client exposes
+   * no other way to cancel an in-flight stream). */
+  private v2EventAbort = new AbortController();
+
+  startV2EventSubscription(): void {
+    if (this.v2EventLoopActive) return;
+    this.v2EventLoopActive = true;
+    this.v2EventLoopStopped = false;
+    void this.v2EventLoop();
+  }
+
+  private async v2EventLoop(): Promise<void> {
+    let backoffMs = 2_000;
+    while (!this.v2EventLoopStopped) {
+      let stream: AsyncGenerator<Record<string, unknown>> | undefined;
+      try {
+        stream = await this.runtime.v2EventStream(this.v2EventAbort.signal);
+      } catch {
+        stream = undefined;
+      }
+      if (!stream) break; // no v2 client — nothing to subscribe
+      try {
+        for await (const evt of stream) {
+          if (this.v2EventLoopStopped) break;
+          const type = (evt as { type?: unknown })?.type;
+          if (typeof type !== "string" || !PERMISSION_LIFECYCLE_EVENT_TYPES.has(type)) continue;
+          await handleOpenCodeEvent(this, evt as never).catch((err) => {
+            console.error(`[swarm] v2 lifecycle event '${type}' handling failed:`, err);
+          });
+        }
+      } catch {
+        // stream dropped / reconnect needed — fall through to backoff
+      }
+      if (this.v2EventLoopStopped) break;
+      await new Promise((r) => setTimeout(r, backoffMs));
+      backoffMs = Math.min(backoffMs * 2, 30_000);
+    }
   }
 
   /**
@@ -1635,6 +1723,77 @@ export class SwarmPluginRuntime implements StallHost {
     return this.runtime.replyPermission?.(sessionID, permissionID, response) ?? Promise.resolve(false);
   }
 
+  /** Answer a V2-engine pending permission request (t-perm-lifecycle) via the
+   * v2 endpoint POST /api/session/{sessionID}/permission/{requestID}/reply.
+   * swarm_permissions routes by the record's engine flag. */
+  replyPermissionV2(sessionID: string, requestID: string, response: "once" | "always" | "reject"): Promise<boolean> {
+    return this.runtime.replyPermissionV2?.(sessionID, requestID, response) ?? Promise.resolve(false);
+  }
+
+  /**
+   * t-perm-lifecycle POLLING BACKSTOP (StallHost). Best-effort poll of the
+   * server's pending-ask GET endpoints for asks the event stream missed (late
+   * SSE subscriber / dropped event / V2 ask never reaching the hook). The
+   * StallDiagnoser merges the returned asks into its 'permission-wall'
+   * evidence and records them (idempotent) so the reply recipe resolves.
+   *
+   * Throttled to once per member session per PERM_POLL_THROTTLE_MS; NEVER
+   * throws (the diagnoser's wall detection must survive an unreachable
+   * server). Returns [] when the v2 client is absent.
+   */
+  async pollPendingAsks(
+    memberSessionIds: string[],
+  ): Promise<Array<{ sessionId: string; id: string; type: string; pattern?: string; title?: string }>> {
+    if (memberSessionIds.length === 0 || !this.runtime.hasV2Client) return [];
+    const now = Date.now();
+    const due = memberSessionIds.filter((s) => (this.permPollAt.get(s) ?? 0) + PERM_POLL_THROTTLE_MS <= now);
+    for (const s of due) this.permPollAt.set(s, now);
+    if (due.length === 0) return [];
+    const want = new Set(due);
+    const out: Array<{ sessionId: string; id: string; type: string; pattern?: string; title?: string }> = [];
+    try {
+      // Global pending asks (GET /api/permission/request) + per-session asks
+      // (GET /api/session/{sessionID}/permission) — belt and suspenders.
+      const [globalAsks, ...perSession] = await Promise.all([
+        this.runtime.listV2PermissionRequests(),
+        ...due.map((sid) => this.runtime.listV2SessionPermissionRequests(sid)),
+      ]);
+      const seen = new Set<string>();
+      const push = (sessionId: string, ask: Record<string, unknown>) => {
+        if (!want.has(sessionId)) return;
+        const id = typeof ask?.id === "string" ? ask.id : undefined;
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        const action = typeof ask?.action === "string"
+          ? ask.action
+          : typeof ask?.permission === "string"
+            ? ask.permission
+            : "permission";
+        const resources = Array.isArray(ask?.resources)
+          ? (ask.resources as unknown[]).filter((r): r is string => typeof r === "string")
+          : [];
+        const title = typeof ask?.title === "string" ? ask.title : undefined;
+        out.push({
+          sessionId,
+          id,
+          type: action,
+          pattern: resources.length > 0 ? resources.join(", ") : title,
+          title,
+        });
+      };
+      for (const ask of globalAsks) {
+        const sid = typeof ask?.sessionID === "string" ? ask.sessionID : undefined;
+        if (sid) push(sid, ask);
+      }
+      for (let i = 0; i < due.length; i++) {
+        for (const ask of perSession[i] ?? []) push(due[i]!, ask);
+      }
+    } catch {
+      // best-effort — a failed poll must never break stall diagnosis
+    }
+    return out;
+  }
+
   /**
    * Blocked-recipient detection (permission-stall escalation): after a message
    * send/reply, check whether any recipient is stuck behind a pending
@@ -2099,12 +2258,38 @@ export async function initSwarmRuntime(input: PluginInput, options: SwarmPluginO
     store = new SQLiteStore(`${swarmsDir}/swarms.db`);
   }
   await store.ready();
-  const runtime = new OpenCodeRuntime(input.client as never, input.directory, input.worktree);
+  // t-perm-lifecycle CLIENT SURFACE: the v1-gen input.client has NO `.v2`
+  // surface (verified against the SDK source), so the V2 (headless server)
+  // permission lifecycle — permission.v2.asked/replied events, the
+  // requestList/session-list polling backstop, and V2 replies — requires a
+  // SECOND client constructed from input.serverUrl via @opencode-ai/sdk/v2.
+  // Best-effort: if the SDK import or construction fails (unusual host), the
+  // plugin still loads and the V1 engine keeps working; V2 features degrade.
+  let v2Client: OpenCodeClientLikeV2 | undefined = options.v2Client;
+  if (!v2Client) {
+    try {
+      const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
+      // The v2 client's config strips a trailing slash itself (mergeConfigs).
+      const c = createOpencodeClient({ baseUrl: input.serverUrl.toString(), directory: input.directory });
+      v2Client = c as unknown as OpenCodeClientLikeV2;
+    } catch (err) {
+      console.warn(`[swarm] v2 permission client unavailable (${errorText(err)}) — V2 permission events/polling/replies degraded`);
+    }
+  }
+  const runtime = new OpenCodeRuntime(input.client as never, input.directory, input.worktree, undefined, undefined, v2Client);
   singleton = new SwarmPluginRuntime(store, runtime, 10_000, options.allowAllMemberPermissions ?? false, options.defaultMemberModel, `${swarmsDir}/emergency.json`);
   // Load the durable emergency state (t-emergency): a system that was tripped
   // before a restart STAYS tripped after it.
   await singleton.emergency.load();
   singleton.scheduleStartupRecovery();
+  // t-perm-lifecycle: subscribe the v2 SSE stream (client.v2.event, /api/event)
+  // so permission.v2.asked/replied + session.next.moved reach the plugin even
+  // when the plugin event hook drops them (the hook filters by event-level
+  // location; the headless SSE has no filter). The event hook still handles
+  // V1 events (permission.asked/replied). Off by default in tests.
+  if (options.subscribeV2Events !== false) {
+    singleton.startV2EventSubscription();
+  }
 
   return singleton;
 }
@@ -5095,7 +5280,14 @@ export async function swarmPlugin(
           if (!rec) {
             return { output: `no pending permission '${args.permissionId}' in this swarm (already answered?)` };
           }
-          const ok = await rt.replyPermission(rec.sessionId, args.permissionId, args.response);
+          // t-perm-lifecycle: route the reply by the ask's ENGINE. V1-engine
+          // asks answer via POST /session/{id}/permissions/{permissionID};
+          // V2-engine asks (headless server) answer via the v2 endpoint
+          // POST /api/session/{sessionID}/permission/{requestID}/reply — the
+          // v1 endpoint does NOT work for V2 asks.
+          const ok = rec.engine === "v2"
+            ? await rt.replyPermissionV2(rec.sessionId, args.permissionId, args.response)
+            : await rt.replyPermission(rec.sessionId, args.permissionId, args.response);
           if (ok) {
             await core.store.respondToPermission(args.permissionId, args.response);
             const member = await core.store.getMemberById(rec.memberId);
@@ -5348,6 +5540,9 @@ export async function swarmPlugin(
               type: input.type,
               pattern: Array.isArray(input.pattern) ? input.pattern.join(", ") : input.pattern,
               title: input.title,
+              // t-perm-lifecycle: the permission.ask hook fires for V1-engine
+              // asks only — swarm_permissions replies route by this flag.
+              engine: "v1",
               response: null,
               respondedAt: null,
               createdAt: Date.now(),
@@ -5392,6 +5587,139 @@ export async function swarmPlugin(
 }
 
 /**
+ * t-perm-lifecycle: record a permission-ask EVENT as a pending permission +
+ * coordinator notification (deduped). Handles BOTH engines:
+ *   - v1: `permission.asked` (payload = PermissionV1.Request
+ *     { id, sessionID, permission, patterns[], ... }) — the FALLBACK recorder
+ *     for the revived permission.ask hook (the hook records V1 asks; INSERT OR
+ *     REPLACE + notifyPermissionPrompt's id-permission dedup make the event
+ *     path a harmless no-op when the hook also fired).
+ *   - v2: `permission.v2.asked` (payload = PermissionV2.Request
+ *     { id, sessionID, action, resources[], ... }) — the ONLY recorder (the
+ *     hook does NOT fire for V2).
+ * Only worker members are recorded (coordinator prompts are the user's own to
+ * answer). Never throws — a failed record must not break the event loop.
+ */
+async function recordPermissionAskEvent(
+  rt: SwarmPluginRuntime,
+  event: { type: string; properties?: Record<string, unknown> },
+  engine: "v1" | "v2",
+): Promise<void> {
+  try {
+    const props = event.properties as Record<string, unknown>;
+    const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined;
+    if (!sessionID) return;
+    const member = await rt.store.getMemberBySessionId(sessionID);
+    if (!member || member.role === "coordinator") return;
+    const id =
+      (typeof props.permissionID === "string" ? props.permissionID : undefined) ??
+      (typeof props.requestID === "string" ? props.requestID : undefined) ??
+      (typeof props.id === "string" ? props.id : undefined);
+    if (!id) return;
+    const type =
+      engine === "v2"
+        ? typeof props.action === "string"
+          ? props.action
+          : "permission"
+        : typeof props.permission === "string"
+          ? props.permission
+          : "permission";
+    const patternParts: string[] = [];
+    for (const key of ["patterns", "resources"] as const) {
+      const v = props[key];
+      if (Array.isArray(v)) {
+        for (const item of v) if (typeof item === "string" && item) patternParts.push(item);
+      }
+    }
+    if (typeof props.pattern === "string" && props.pattern) patternParts.push(props.pattern);
+    const patternText = patternParts.length > 0 ? patternParts.join(", ") : undefined;
+    const title = typeof props.title === "string" && props.title ? props.title : undefined;
+    const p: PendingPermission = {
+      id,
+      swarmId: member.swarmId,
+      memberId: member.id,
+      sessionId: sessionID,
+      type,
+      pattern: patternText,
+      title,
+      engine,
+      response: null,
+      respondedAt: null,
+      createdAt: Date.now(),
+    };
+    await rt.store.insertPendingPermission(p);
+    await rt.notifyPermissionPrompt(p);
+    // Timeline: the member hit a permission wall (permission.asked). The hook
+    // path records this too — INSERT OR REPLACE keeps a single row per id.
+    await recordEvent(rt.store, {
+      swarmId: member.swarmId,
+      type: "permission.asked",
+      actorMemberId: member.id,
+      entityType: "permission",
+      entityId: p.id,
+      payloadJson: JSON.stringify({ memberId: member.id, type: p.type, engine }),
+    }).catch((err) => {
+      console.error(`[swarm] permission.asked timeline failed:`, err);
+    });
+  } catch (err) {
+    console.error(`[swarm] permission.${engine}.asked recording failed:`, err);
+  }
+}
+
+/**
+ * t-perm-lifecycle SESSION RE-ROOT HEALING (the invisible-wall fix). The
+ * server publishes `session.next.moved` with { sessionID, location, ... } when
+ * a session's directory changes (the id is kept). A re-created-session variant
+ * may additionally carry the new session id (newSessionID / nextSessionID).
+ * Heal EVERY member row currently mapped to the moved session:
+ *   - kept-id move: re-assert the mapping (idempotent) so the store view stays
+ *     fresh after the directory change;
+ *   - explicit new id: reassign member.sessionId old -> new, so asks from the
+ *     re-rooted session resolve in the store and walls record + notify
+ *     normally (PermissionTrace's invisible-wall repro).
+ * Records a 'member.rerooted' timeline event per member. Never throws.
+ */
+async function healRerootedSession(
+  rt: SwarmPluginRuntime,
+  event: { type: string; properties?: Record<string, unknown> },
+): Promise<void> {
+  try {
+    const props = event.properties as Record<string, unknown>;
+    const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined;
+    if (!sessionID) return;
+    const newSessionID =
+      (typeof props.newSessionID === "string" ? props.newSessionID : undefined) ??
+      (typeof props.nextSessionID === "string" ? props.nextSessionID : undefined) ??
+      sessionID;
+    const location = (typeof props.location === "object" && props.location !== null
+      ? props.location
+      : {}) as { directory?: string; workspaceID?: string };
+    const members = await rt.store.listMembersBySessionId(sessionID);
+    for (const member of members) {
+      if (member.sessionId !== newSessionID) {
+        await rt.store.assignMemberSession(member.id, newSessionID);
+      }
+      await recordEvent(rt.store, {
+        swarmId: member.swarmId,
+        type: "member.rerooted",
+        actorMemberId: member.id,
+        entityType: "member",
+        entityId: member.id,
+        payloadJson: JSON.stringify({
+          sessionID: newSessionID,
+          directory: typeof location.directory === "string" ? location.directory : null,
+          workspaceID: typeof location.workspaceID === "string" ? location.workspaceID : null,
+        }),
+      }).catch((err) => {
+        console.error(`[swarm] member.rerooted timeline failed:`, err);
+      });
+    }
+  } catch (err) {
+    console.error(`[swarm] session.next.moved healing failed:`, err);
+  }
+}
+
+/**
  * Event-driven supervision (§34): reduce an OpenCode event into durable state,
  * then, after the state commit, perform external effects (mailbox wakeup).
  * Never holds DB locks across external calls.
@@ -5402,11 +5730,26 @@ export async function handleOpenCodeEvent(
 ): Promise<void> {
   const { supervisor, broker, store, core } = rt;
 
-  // Permission bookkeeping: when the USER answers a permission prompt in the
-  // app (permission.replied event), mark the recorded pending prompt replied so
-  // it stops appearing in swarm_permissions list (the member is unblocked —
-  // the prompt never becomes a stale "stuck" entry). Best-effort; a missing row
-  // (prompt never recorded via permission.ask) is a no-op.
+  // ==== Permission lifecycle events (t-perm-lifecycle) ====
+  //
+  // Two permission engines emit different event names (mapped by the
+  // opencode-codebase swarm, deliverable/permission-lifecycle-map):
+  //   V1 (app/TUI): permission.asked / permission.replied — the revived
+  //                  permission.ask hook ALREADY records V1 asks, so the
+  //                  asked-handler below is an idempotent FALLBACK (fires
+  //                  when the hook didn't, e.g. mid-plugin-load).
+  //   V2 (headless): permission.v2.asked / permission.v2.replied — the hook
+  //                  NEVER fires for V2; the asked-handler is the ONLY
+  //                  recorder, and the reply routes to the V2 endpoint.
+  //   session.next.moved — the session re-root surface (invisible-wall fix):
+  //                  heal the member's sessionId mapping + record
+  //                  'member.rerooted' so subsequent asks resolve in the store.
+
+  // (c) V1 replied — legacy bookkeeping: the USER answered in the app, mark
+  // the recorded pending prompt replied so it stops appearing in
+  // swarm_permissions list (the member is unblocked — the prompt never
+  // becomes a stale "stuck" entry). Best-effort; a missing row (prompt never
+  // recorded via permission.ask) is a no-op.
   if (event.type === "permission.replied") {
     const permissionID = (event.properties as { permissionID?: string })?.permissionID;
     if (permissionID) {
@@ -5414,6 +5757,44 @@ export async function handleOpenCodeEvent(
         console.error(`[swarm] permission.replied bookkeeping failed:`, err);
       });
     }
+  }
+
+  // (b') V2 replied — the headless server answered (or the coordinator replied
+  // via the v2 endpoint). Same bookkeeping: mark the recorded pending prompt
+  // replied. requestID is the pending permission id.
+  if (event.type === "permission.v2.replied") {
+    const props = event.properties as { sessionID?: string; requestID?: string; reply?: unknown };
+    const requestID = props.requestID;
+    if (requestID) {
+      await store.markPermissionReplied(requestID, String(props.reply ?? "replied")).catch((err) => {
+        console.error(`[swarm] permission.v2.replied bookkeeping failed:`, err);
+      });
+    }
+  }
+
+  // (a) V1 asked — fallback recorder for the revived permission.ask hook.
+  // INSERT OR REPLACE is idempotent (the hook's record is overwritten in
+  // place) and notifyPermissionPrompt dedupes by permission id, so the event
+  // path can never double-record or double-notify when the hook also fired.
+  if (event.type === "permission.asked") {
+    await recordPermissionAskEvent(rt, event, "v1");
+  }
+
+  // (b) V2 asked — the ONLY recorder for headless-server asks (the hook does
+  // not fire for V2).
+  if (event.type === "permission.v2.asked") {
+    await recordPermissionAskEvent(rt, event, "v2");
+  }
+
+  // (d) session re-root healing — the invisible-wall fix (t-perm-lifecycle).
+  // The event's properties.sessionID is the session that moved; the re-created
+  // variant may carry the new id explicitly (newSessionID/nextSessionID).
+  // Heal EVERY member row mapped to that session (multi-own: a session can be
+  // the coordinator row of N swarms) and surface a 'member.rerooted' timeline
+  // event. After healing, asks from the re-rooted session resolve in the store
+  // and walls record + notify normally.
+  if (event.type === "session.next.moved") {
+    await healRerootedSession(rt, event);
   }
 
   // Members that already received a mailbox delivery this event (they were

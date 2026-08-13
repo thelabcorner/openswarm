@@ -185,6 +185,18 @@ export interface StallHost {
   releaseMemberTask(member: SwarmMember, reason: string): Promise<boolean>;
   /** Session-absent: re-create the member's backing session. */
   respawnMember(member: SwarmMember): Promise<string | undefined>;
+  /**
+   * t-perm-lifecycle POLLING BACKSTOP: best-effort poll of the server's
+   * pending-ask GET endpoints (GET /api/permission/request +
+   * GET /api/session/{sessionID}/permission) for asks the event stream missed
+   * (late SSE subscriber / dropped event). The diagnoser merges the returned
+   * asks into its 'permission-wall' evidence (and records them idempotently)
+   * so stall reports catch walls even when events were never seen. Throttled
+   * by the host (once per session per window); NEVER throws.
+   */
+  pollPendingAsks?(
+    memberSessionIds: string[],
+  ): Promise<Array<{ sessionId: string; id: string; type: string; pattern?: string; title?: string }>>;
 }
 
 export class StallDiagnoser {
@@ -355,16 +367,57 @@ export class StallDiagnoser {
     now: number;
   }> {
     const now = this.host.now();
-    const [tasks, pending, pendingMail] = await Promise.all([
+    const [tasks, pending, pendingMail, members] = await Promise.all([
       this.host.store.listTasks(swarm.id),
       this.host.store.listPendingPermissions(swarm.id),
       this.host.store.listMembersWithPendingMail(),
+      this.host.store.listMembers(swarm.id),
     ]);
     const pendingByMember = new Map<string, PendingPermission[]>();
+    const knownIds = new Set<string>();
     for (const p of pending) {
+      knownIds.add(p.id);
       const list = pendingByMember.get(p.memberId) ?? [];
       list.push(p);
       pendingByMember.set(p.memberId, list);
+    }
+    // t-perm-lifecycle POLLING BACKSTOP: the event stream is a bounded live
+    // channel — a subscriber connecting after an ask was created (or a dropped
+    // event) never sees it. Poll the server's pending-ask GET endpoints once
+    // per diagnose pass and merge any ask the store does not already know into
+    // the 'permission-wall' evidence. Missing asks are ALSO recorded (INSERT
+    // OR REPLACE — idempotent) so the ladder's reply recipe's permissionId
+    // resolves via swarm_permissions. Best-effort; a failed poll must never
+    // break stall diagnosis.
+    try {
+      const workerSessions = members.filter((m) => m.role !== "coordinator").map((m) => m.sessionId);
+      const polled = (await this.host.pollPendingAsks?.(workerSessions)) ?? [];
+      for (const ask of polled) {
+        if (knownIds.has(ask.id)) continue;
+        const member = members.find((m) => m.sessionId === ask.sessionId);
+        if (!member || member.role === "coordinator") continue;
+        const rec: PendingPermission = {
+          id: ask.id,
+          swarmId: swarm.id,
+          memberId: member.id,
+          sessionId: ask.sessionId,
+          type: ask.type,
+          pattern: ask.pattern,
+          title: ask.title,
+          // Polled asks come from the V2 headless endpoints.
+          engine: "v2",
+          response: null,
+          respondedAt: null,
+          createdAt: now,
+        };
+        await this.host.store.insertPendingPermission(rec).catch(() => { /* idempotent */ });
+        knownIds.add(ask.id);
+        const list = pendingByMember.get(member.id) ?? [];
+        list.push(rec);
+        pendingByMember.set(member.id, list);
+      }
+    } catch {
+      // polling is best-effort — never fail the diagnose pass
     }
     return { tasks, pendingByMember, pendingMail: new Set(pendingMail.map((x) => x.memberId)), now };
   }

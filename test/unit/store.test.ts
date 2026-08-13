@@ -677,13 +677,14 @@ describe("SQLiteStore", () => {
 
       const reopened = new SQLiteStore(join(dir3, "old.db"));
       await reopened.ready();
-      // user_version reached the latest migration (12: swarm_member.session_id
+      // user_version reached the latest migration (13: pending-permission
+      // engine column — v1/v2 permission lifecycle; 12: swarm_member.session_id
       // UNIQUE dropped — multi-own; 11: deliverables+contracts;
       // 10: pending permissions; 9: task reserved_for; 8 = message.noreply;
       // 7 = resonant_at, Hive H2; 6 = beliefs, 5 = annotations, 4 = lease
       // columns, 3 = expires_at).
       const uv = await (reopened as any).db.query(`PRAGMA user_version`).get();
-      expect((uv as { user_version: number } | undefined)?.user_version).toBe(12);
+      expect((uv as { user_version: number } | undefined)?.user_version).toBe(13);
       // Columns present + usable.
       await reopened.insertSwarm(newSwarm("uv"));
       const swarm = await reopened.getSwarm("swarm-uv");
@@ -708,6 +709,11 @@ describe("SQLiteStore", () => {
       // The swarm-scoped lookup resolves within the (session, swarm) pair —
       // both rows share the session, and the second insert is reachable.
       expect((await reopened.getMemberByName("swarm-uv", "coordinator2"))?.sessionId).toBe("ses-uv-a");
+      // v13 (permission lifecycle): the migrated DB's pending-permission table
+      // carries the engine column and round-trips the v1/v2 flag.
+      await reopened.insertPendingPermission({ id: "uv-perm", swarmId: "swarm-uv", memberId: a, sessionId: "ses-uv-a", type: "edit", pattern: "src/**", engine: "v2", response: null, respondedAt: null, createdAt: now });
+      const uvPerm = await reopened.getPendingPermission("swarm-uv", "uv-perm");
+      expect(uvPerm?.engine).toBe("v2");
       await reopened.close();
     } finally {
       try { rmSync(dir3, { recursive: true, force: true }); } catch { /* ignore */ }

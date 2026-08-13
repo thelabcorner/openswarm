@@ -57,6 +57,8 @@ openswarm turns OpenCode into a coordination fabric for multiple agents. Instead
 - **Injected-content fencing** — all peer-authored text is visibly marked as untrusted data.
 - **Permission-boundary scoping** — worktree/temp scoping with traversal protection; members never widen the coordinator's grants.
 - **Autopermissions propagation** — coordinator permission state propagates to members, clamped (never widened).
+- **Permission-wall escalation, both engines** — OpenCode has two permission engines: **V1** (app/TUI; emits `permission.asked`/`permission.replied` and fires the plugin's `permission.ask` hook) and **V2** (headless server; emits `permission.v2.asked`/`permission.v2.replied`, which the hook never sees). The plugin subscribes to the V2 SSE stream (`client.v2.event`, `/api/event`), records member asks from either engine (flagged `v1`/`v2`), notifies the coordinator once per ask, and answers via the matching engine endpoint — `swarm_permissions` reply routes V1 asks to `POST /session/{id}/permissions/{permissionID}` and V2 asks to `POST /api/session/{sessionID}/permission/{requestID}/reply`. A polling backstop (`/api/permission/request` + per-session list) catches asks the event stream missed.
+- **Session re-root healing** — the plugin observes `session.next.moved` and re-maps the member's `sessionId` (`member.rerooted` timeline event), so asks from a re-rooted/re-created member session still resolve in the store and escalate normally instead of hitting an invisible permission wall.
 - **Coordinator-only destructive ops** — `swarm_delete`, `swarm_stop`, `swarm_remove` are gated and confirm-protected.
 
 ### Reliability

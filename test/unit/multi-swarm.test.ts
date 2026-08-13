@@ -305,11 +305,12 @@ describe("migration v12 (sqlite)", () => {
       });
       await old.close();
 
-      // Reopen: migrate() must advance to v12 and drop the UNIQUE(session_id).
+      // Reopen: migrate() must advance to the latest migration (13 —
+      // pending-permission engine column; 12 dropped the UNIQUE(session_id)).
       const reopened = new SQLiteStore(join(dir2, "old.db"));
       await reopened.ready();
       const uv = await (reopened as any).db.query(`PRAGMA user_version`).get();
-      expect((uv as { user_version: number }).user_version).toBe(12);
+      expect((uv as { user_version: number }).user_version).toBe(13);
 
       await reopened.insertSwarm(newSwarm("m1"));
       await reopened.insertSwarm(newSwarm("m2"));

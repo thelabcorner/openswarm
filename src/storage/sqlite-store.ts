@@ -288,7 +288,9 @@ CREATE INDEX IF NOT EXISTS idx_subscription_swarm ON swarm_subscription(swarm_id
 -- swarm_permissions (reply once/always/reject) so headless members never
 -- stall on an unanswered prompt. response: null while pending, else the
 -- answer (once/always/reject — or the raw string from the permission.replied
--- event when the user answered in the app).
+-- event when the user answered in the app). engine (migration v13): 'v1'
+-- (app/TUI permission.ask hook or permission.asked event) or 'v2' (headless
+-- permission.v2.asked event) — routes the reply endpoint.
 CREATE TABLE IF NOT EXISTS swarm_pending_permission (
   id TEXT PRIMARY KEY,
   swarm_id TEXT NOT NULL,
@@ -297,6 +299,7 @@ CREATE TABLE IF NOT EXISTS swarm_pending_permission (
   type TEXT NOT NULL,
   pattern TEXT,
   title TEXT,
+  engine TEXT,
   response TEXT,
   responded_at INTEGER,
   created_at INTEGER NOT NULL,
@@ -409,6 +412,7 @@ interface RowBelief {
 interface RowPendingPermission {
   id: string; swarm_id: string; member_id: string; session_id: string;
   type: string; pattern: string | null; title: string | null;
+  engine: string | null;
   response: string | null; responded_at: number | null; created_at: number;
 }
 
@@ -416,6 +420,7 @@ function toPendingPermission(r: RowPendingPermission): PendingPermission {
   return {
     id: r.id, swarmId: r.swarm_id, memberId: r.member_id, sessionId: r.session_id,
     type: r.type, pattern: r.pattern ?? undefined, title: r.title ?? undefined,
+    engine: r.engine === "v1" || r.engine === "v2" ? r.engine : undefined,
     response: r.response, respondedAt: r.responded_at, createdAt: r.created_at,
   };
 }
@@ -657,6 +662,9 @@ export class SQLiteStore implements SwarmStore {
       this.addMissingColumn("swarm_task", "lease_expires_at", "INTEGER");
       // Wave 5 (Hive H2): resonant_at — mirrored in MIGRATIONS v7.
       this.addMissingColumn("swarm_belief", "resonant_at", "INTEGER");
+      // Permission lifecycle (migration v13): engine column — mirrored in
+      // MIGRATIONS v13.
+      this.addMissingColumn("swarm_pending_permission", "engine", "TEXT");
     });
   }
 
@@ -915,6 +923,11 @@ export class SQLiteStore implements SwarmStore {
         // do here either — the step exists to keep the chain's version numbering
         // truthful (the migration boundary IS v12).
       },
+    },
+    {
+      version: 13,
+      label: "add swarm_pending_permission.engine (permission lifecycle: v1 | v2)",
+      up: (db) => addColumn(db, "swarm_pending_permission", "engine", "TEXT"),
     },
   ];
 
@@ -1515,9 +1528,9 @@ class Tx implements SwarmStoreTx {
   async insertPendingPermission(p: PendingPermission): Promise<void> {
     this.db.run(
       `INSERT OR REPLACE INTO swarm_pending_permission
-         (id, swarm_id, member_id, session_id, type, pattern, title, response, responded_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [p.id, p.swarmId, p.memberId, p.sessionId, p.type, p.pattern ?? null, p.title ?? null, p.response, p.respondedAt, p.createdAt],
+         (id, swarm_id, member_id, session_id, type, pattern, title, engine, response, responded_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [p.id, p.swarmId, p.memberId, p.sessionId, p.type, p.pattern ?? null, p.title ?? null, p.engine ?? null, p.response, p.respondedAt, p.createdAt],
     );
   }
 

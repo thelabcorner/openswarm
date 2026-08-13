@@ -165,6 +165,13 @@ export interface PendingPermission {
   /** The requested pattern (command / path / url), untrusted data. */
   pattern?: string;
   title?: string;
+  /** The permission engine the ask came from (t-perm-lifecycle, migration v13):
+   * 'v1' = the app/TUI engine (permission.ask hook / permission.asked event),
+   * 'v2' = the headless server engine (permission.v2.asked event — the hook
+   * does NOT fire for V2). Routes swarm_permissions replies to the matching
+   * endpoint: v1 -> POST /session/{id}/permissions/{permissionID}; v2 ->
+   * POST /api/session/{sessionID}/permission/{requestID}/reply. */
+  engine?: "v1" | "v2";
   /** null while pending; "once" | "always" | "reject" after answered. */
   response: string | null;
   respondedAt: number | null;

@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS swarm_pending_permission (
   type TEXT NOT NULL,
   pattern TEXT,
   title TEXT,
+  engine TEXT,
   response TEXT,
   responded_at INTEGER,
   created_at INTEGER NOT NULL,
