@@ -95,6 +95,56 @@ export interface SwarmPolicies {
    * to respawn-on-absent / release. Default 3 (the historical
    * WATCHDOG_MAX_STRIKES constant). */
   watchdogMaxStrikes?: number;
+  /** Flood rate controls (t-flood-rate). In-memory per-swarm/per-member
+   * counters; all numbers below are policy-overridable baselines.
+   * Non-urgent mailbox-prompt budget per member per 60s — excess non-urgent
+   * mail stays QUEUED and is delivered at the next window boundary by the
+   * F-M7 pending-mail sweep. URGENT always bypasses. Default 5. */
+  maxInboxPerMin?: number;
+  /** Per-sender soft send quota per 60s (broadcast = 1 send regardless of
+   * recipient count). Exceeding still succeeds but logs a warn, sends the
+   * sender a noreply finding, and suppresses broadcast+mention fan-out for
+   * the window (direct sends keep working). Default 30. */
+  senderSendQuotaPerMin?: number;
+  /** Mention fan-out cap per message: at most this many mentioned recipients
+   * are auto-notified; extra mentions are ignored with a note. Default 10. */
+  mentionFanOutCap?: number;
+  /** Cross-swarm force-message quota per sender per 60s. Default 10. */
+  senderForceQuotaPerMin?: number;
+  /** hive_need routing caps per member per `needRateWindowMs` — at most
+   * `needShoutPerWindow` shouts and `needWhisperPerWindow` whispers; excess
+   * returns guidance 'need rate-limited — retry later' without sending.
+   * Defaults: 1 shout + 3 whispers per 5 min. */
+  needShoutPerWindow?: number;
+  needWhisperPerWindow?: number;
+  needRateWindowMs?: number;
+  /** Minimum gap between digest-health FLIP notices regardless of oscillation
+   * (a fresh/stale flip-flop must not spam the coordinator). Default 5 min. */
+  digestFlipNoticeMinMs?: number;
+  /** Team-sync cooldown when the ONLY delta since the last sync was completed
+   * tasks (notice-noise damping: completion churn alone must not re-fire the
+   * digest every 45s). Default 2 min; a ready-task delta still fires at the
+   * normal 45s cooldown. */
+  teamSyncCompletedCooldownMs?: number;
+  /** Notice aggregator flush window (ms): coordinator-facing notices are
+   * debounced into ONE digest turn per swarm per window (anti-flood core).
+   * Default 5s (the historical 1.5s completion batcher fired every window
+   * under sustained churn). */
+  noticeFlushMs?: number;
+  /** Notice aggregator line cap: at most this many digest lines per flush,
+   * with a '+M more' overflow line. Default 10. */
+  noticeLineCap?: number;
+  /** External guest messaging (t-guest-messaging): when true (the default —
+   * undefined reads as true; set by DEFAULT_POLICIES), a NON-swarm chat session
+   * that calls swarm_message/swarm_reply is seamlessly auto-registered as a
+   * GUEST member (role 'guest', name 'guest-<short>', status idle, workspaceMode
+   * shared-read) of the target swarm — no consent, no ceremony. Guests can
+   * message/reply like members but never receive tasks (scheduler excludes role
+   * guest), are never respawned by recovery/watchdog (their session is the
+   * user's own chat), and remain blocked from coordinator-only tools. When
+   * false, non-member sessions are rejected with a clear error instead of
+   * being registered. */
+  allowExternalGuests?: boolean;
 }
 
 export const DEFAULT_POLICIES: SwarmPolicies = {
@@ -114,6 +164,7 @@ export const DEFAULT_POLICIES: SwarmPolicies = {
   reservationTtlMs: 600_000,
   watchdogSilenceMs: 300_000,
   watchdogMaxStrikes: 3,
+  allowExternalGuests: true,
 };
 
 /** Default delivery-attempt budget for messages (audit/messaging F-M5). */

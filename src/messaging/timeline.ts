@@ -104,6 +104,10 @@ function humanSentence(ev: SwarmEvent, ctx: TimelineContext): string {
       return `${actor} spawned member '${String(p.name ?? "?")}'${p.role ? ` (${String(p.role)})` : ""}`;
     case "member.stopped":
       return p.name ? `${actor} stopped member '${String(p.name)}'` : `${actor} stopped a member`;
+    case "member.removed":
+      return p.name
+        ? `${actor} removed member '${String(p.name)}'${p.reason ? ` — reason: ${String(p.reason)}` : ""}`
+        : `${actor} removed a member (${ev.entityId ?? "?"})`;
     case "member.idle":
       return `${actor} went idle`;
     case "member.respawned":

@@ -130,20 +130,22 @@ describe("notifyPruning (integration, non-trivial only)", () => {
   });
 });
 
-describe("notifyDigestFlip (integration, transition dedupe)", () => {
-  test("flip fresh->stale notifies once; same-health repeats do not", async () => {
+describe("notifyDigestFlip (integration, transition dedupe + flap damping)", () => {
+  test("flip notifies; same-health repeats and rapid flip-flop are damped (min 5 min between notices)", async () => {
     const { swarm, coordinator } = await makeSwarm();
     const flip = await core.notifyDigestFlip({ swarmId: swarm.id, health: "stale", lastKnownHealth: "fresh" });
     expect(flip.notified).toBe(true);
     // Same health again with lastKnown=stale: no flip.
     const same = await core.notifyDigestFlip({ swarmId: swarm.id, health: "stale", lastKnownHealth: "stale" });
     expect(same.notified).toBe(false);
-    // Flip back healthy.
+    // Flip back healthy WITHIN the 5-min damping window (t-flood-rate): the
+    // notice is suppressed regardless of oscillation — one flip notice per
+    // 5 min per swarm, not one per transition.
     const back = await core.notifyDigestFlip({ swarmId: swarm.id, health: "fresh", lastKnownHealth: "stale" });
-    expect(back.notified).toBe(true);
+    expect(back.notified).toBe(false);
     const coordMsgs = await store.listPendingMessages(coordinator.id);
     const digestNotices = coordMsgs.filter((x) => x.body.text.includes("[HIVE DIGEST]"));
-    expect(digestNotices.length).toBe(2); // exactly the two flips
+    expect(digestNotices.length).toBe(1); // only the first flip within the window
     void coordinator;
   });
 

@@ -42,6 +42,7 @@ openswarm turns OpenCode into a coordination fabric for multiple agents. Instead
 - Members are **real OpenCode chats** — open any member in the app and talk to it directly.
 - While you chat, the swarm **yields** (mail, task continuation, and scheduling pause); it resumes automatically after a lull.
 - `swarm_release` force-resumes a member immediately when the 5-minute lull is too slow.
+- **External guests** — non-swarm chats can message swarms seamlessly (auto-registered as role `guest`, name `guest-xxxx`); guests never get tasks, are never respawned, and coordinator-only tools stay restricted (opt out via `allowExternalGuests: false`).
 
 ### Hive layer
 

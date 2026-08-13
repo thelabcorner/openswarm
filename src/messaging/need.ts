@@ -23,6 +23,10 @@ import { fence } from "../core/fence.js";
 
 export type NeedTier = "whisper" | "shout";
 
+/** Guidance returned when a member exceeds the hive_need rate cap
+ * (t-flood-rate): the need is NOT routed, the caller should retry later. */
+export const NEED_RATE_LIMITED_GUIDANCE = "need rate-limited — retry later";
+
 /** A member selected as a need recipient, with the reason it matched. */
 export interface NeedRecipient {
   member: SwarmMember;

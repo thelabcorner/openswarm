@@ -4,6 +4,7 @@ import { DEFAULT_MAX_DELIVERY_ATTEMPTS } from "../core/types.js";
 import type { SwarmStore } from "../storage/store.js";
 import { formatEnvelope, senderNames } from "./formatter.js";
 import { enrichForeignSenderNames } from "./senders.js";
+import { RateLimiter, DEFAULT_MAX_INBOX_PER_MIN } from "./rate-limits.js";
 
 export interface BrokerOptions {
   /** Maximum messages batched into a single wake delivery. */
@@ -18,6 +19,15 @@ export interface BrokerOptions {
    * 0 retries = fail after the first failure. Negative values are not
    * supported (treated as 0). (audit/messaging F-M5) */
   maxDeliveryAttempts?: number;
+  /** Non-urgent mailbox-PROMPT budget per member per 60s (t-flood-rate inbox
+   * throttle). At most this many prompts are injected into one member's
+   * session per window; excess non-urgent mail stays `queued` and is
+   * delivered at the next window boundary by the F-M7 pending-mail sweep.
+   * URGENT always bypasses. When the option is unset the member's swarm
+   * policy `maxInboxPerMin` is honored, then this default. */
+  maxInboxPerMin?: number;
+  /** Clock for deterministic tests (defaults to Date.now). */
+  now?: () => number;
   /** Called once when a message is marked `failed` after exhausting its
    * delivery retry budget — the plugin wires this to notify the sender.
    * (audit/messaging F-M5) */
@@ -43,12 +53,29 @@ export interface BrokerOptions {
  */
 export class Broker {
   private lastDeliveryAt = new Map<string, number>();
+  /** In-memory inbox throttle: timestamps of prompts injected per member
+   * (t-flood-rate). */
+  private readonly inboxPrompts: RateLimiter;
+  private readonly now: () => number;
 
   constructor(
     private store: SwarmStore,
     private runtime: AgentRuntime,
     private options: BrokerOptions = {},
-  ) {}
+  ) {
+    this.now = options.now ?? Date.now;
+    this.inboxPrompts = new RateLimiter({ now: this.now });
+  }
+
+  /** Resolve the per-recipient inbox budget: broker option → swarm policy →
+   * default. The swarm policy is read live so a policy change takes effect
+   * without a restart. */
+  private async inboxBudget(memberId: string): Promise<number> {
+    if (this.options.maxInboxPerMin !== undefined) return this.options.maxInboxPerMin;
+    const member = await this.store.getMemberById(memberId).catch(() => undefined);
+    const swarm = member ? await this.store.getSwarm(member.swarmId).catch(() => undefined) : undefined;
+    return swarm?.policies.maxInboxPerMin ?? DEFAULT_MAX_INBOX_PER_MIN;
+  }
 
   /**
    * Deliver all queued messages to an idle member. Returns the number of
@@ -73,45 +100,59 @@ export class Broker {
     const pending = await this.store.listPendingMessages(memberId);
     if (pending.length === 0) return 0;
 
+    // Inbox throttle (t-flood-rate): at most MAX_INBOX_PER_MIN non-urgent
+    // prompts per member per 60s. Excess non-urgent mail stays QUEUED (no
+    // prompt) — the F-M7 pending-mail sweep retries it, so it is delivered at
+    // the next window boundary. URGENT always bypasses the budget.
+    const budget = await this.inboxBudget(memberId);
+    const urgent = pending.filter((m) => m.priority === "urgent");
+    const nonUrgent = pending.filter((m) => m.priority !== "urgent");
+    const used = this.inboxPrompts.count(`inbox:${memberId}`, 60_000);
+    const remaining = Math.max(0, budget - used);
+    if (remaining === 0 && urgent.length === 0) return 0; // budget spent, no urgent mail
+    // Urgent first (never starved by the budget or the batch cap), then as many
+    // non-urgent messages as the remaining budget allows.
+    const batchLimit = this.options.batchSize ?? 10;
+    const toDeliver = [...urgent, ...nonUrgent.slice(0, remaining)].slice(0, batchLimit);
+    if (toDeliver.length === 0) return 0;
+
     // Throttle: don't inject another mailbox turn too soon after the previous
     // one — a flooded member would otherwise be preempted repeatedly and never
     // get to its task work. URGENT messages bypass the cooldown (F-M7: urgent
     // must not wait on idle/cooldown where feasible).
     const cooldown = this.options.deliveryCooldownMs ?? 30_000;
-    const hasUrgent = pending.some((m) => m.priority === "urgent");
+    const hasUrgent = toDeliver.some((m) => m.priority === "urgent");
     if (!hasUrgent) {
       const last = this.lastDeliveryAt.get(memberId) ?? 0;
-      if (Date.now() - last < cooldown) return 0;
+      if (this.now() - last < cooldown) return 0;
     }
-    this.lastDeliveryAt.set(memberId, Date.now());
-
-    const batch = pending.slice(0, this.options.batchSize ?? 10);
+    this.lastDeliveryAt.set(memberId, this.now());
 
     // Atomically claim the batch. If another wake already scheduled these
     // messages, this wake aborts instead of double-delivering.
-    const claimed = await this.store.markMessagesScheduled(memberId, batch.map((m) => m.id));
+    const claimed = await this.store.markMessagesScheduled(memberId, toDeliver.map((m) => m.id));
     if (claimed === 0) return 0;
-    const toDeliver = batch.slice(0, claimed);
+    const deliveredBatch = toDeliver.slice(0, claimed);
 
     const names = await this.memberNames(memberId);
     // Cross-swarm messages carry a sender from another swarm — resolve those
     // ids to `name@swarm` so the recipient always sees the origin.
-    await enrichForeignSenderNames(this.store, toDeliver, names);
+    await enrichForeignSenderNames(this.store, deliveredBatch, names);
     const self = await this.store.getMemberById(memberId);
     const ctx = await this.memberContext(memberId, names);
-    const inbox = toDeliver.map((m) => formatEnvelope(m, names)).join("\n\n");
+    const inbox = deliveredBatch.map((m) => formatEnvelope(m, names)).join("\n\n");
     // Noreply: when EVERY message in the batch is fire-and-forget, the member
     // is explicitly told no response is expected — saves a mailbox turn and
     // cooldown that an ack-only reply would have burned (noreply feature).
-    const allNoreply = toDeliver.length > 0 && toDeliver.every((m) => m.noreply);
+    const allNoreply = deliveredBatch.length > 0 && deliveredBatch.every((m) => m.noreply);
     const replyLine = allNoreply
       ? "[no replies needed — do not respond unless you can act or escalate]"
       : "[reply where needed — swarm_message (to: <name>) or swarm_reply ([msg:...])]";
-    const senders = senderNames(toDeliver, names);
+    const senders = senderNames(deliveredBatch, names);
     const header =
-      toDeliver.length === 1
+      deliveredBatch.length === 1
         ? `[NEW MESSAGE FROM: ${senders.join(", ")}]`
-        : `[NEW MESSAGES (${toDeliver.length}) FROM: ${senders.join(", ")}]`;
+        : `[NEW MESSAGES (${deliveredBatch.length}) FROM: ${senders.join(", ")}]`;
     // A normal user turn (not synthetic) prefixed with the necessary swarm
     // context so the receiving agent can act: its identity, the swarm id
     // (required as a tool argument), and the sender of each message.
@@ -129,14 +170,18 @@ export class Broker {
       // Delivery failed: record the error, increment the attempt count, and
       // enforce the retry budget — messages past maxDeliveryAttempts go
       // `failed` (sender notified once) instead of retrying forever (F-M5).
-      await this.revertScheduled(memberId, toDeliver, err);
+      await this.revertScheduled(memberId, deliveredBatch, err);
       throw err;
     }
 
+    // A prompt actually fired — count it toward the per-minute budget (only on
+    // success: a reverted delivery is a retry, not a delivered prompt).
+    this.inboxPrompts.hit(`inbox:${memberId}`, 60_000);
+
     // Persist delivery result (mark delivered). Best-effort: even if this
     // commit fails, the message stays 'scheduled' and recovery reconciles it.
-    await this.markDelivered(toDeliver);
-    return toDeliver.length;
+    await this.markDelivered(deliveredBatch);
+    return deliveredBatch.length;
   }
 
   /**

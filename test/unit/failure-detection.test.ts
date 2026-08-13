@@ -133,11 +133,13 @@ function lastMessage(sessionId: string, role: "assistant" | "user", parts: Array
   ];
 }
 
-/** Coordinator [CHAT FAILURE] finding messages for a swarm. */
-async function chatFailureNotices(swarmId: string) {
+/** Coordinator [CHAT FAILURE] digest text for a swarm (t-flood-aggregate:
+ * advisories are delivered as lines of the debounced coordinator digest
+ * instead of mailbox findings). Forces a flush and returns the rendered
+ * digest ("" when nothing was pending). */
+async function chatFailureDigest(swarmId: string): Promise<string> {
   const rt = await runtime();
-  const all = await rt!.store.listMessagesBySwarm(swarmId, 100);
-  return all.filter((m) => m.kind === "finding" && m.body.text.includes("[CHAT FAILURE]"));
+  return (await rt.notices.flush(swarmId)) ?? "";
 }
 
 async function reportFor(swarmId: string, sessionID: string): Promise<string> {
@@ -331,11 +333,11 @@ describe("d. notifyProviderError dedup (ladder passes)", () => {
     await rt.stalls.executeNext(swarmId);
     await rt.stalls.executeNext(swarmId);
 
-    const notices = await chatFailureNotices(swarmId);
-    expect(notices.length).toBe(1);
-    expect(notices[0]!.body.text).toContain("[CHAT FAILURE]");
-    expect(notices[0]!.body.text).toContain("member 'worker' hit auth");
-    expect(notices[0]!.body.text).toContain("remedy: check provider credentials");
+    const text = await chatFailureDigest(swarmId);
+    const chatFailureLines = text.split("\n").filter((l) => l.includes("[CHAT FAILURE]"));
+    expect(chatFailureLines.length).toBe(1);
+    expect(chatFailureLines[0]).toContain("member 'worker' hit auth");
+    expect(chatFailureLines[0]).toContain("remedy: check provider credentials");
   });
 
   test("distinct subtypes notify independently (auth via CHAT FAILURE, quota via USAGE LIMIT)", async () => {
@@ -353,15 +355,14 @@ describe("d. notifyProviderError dedup (ladder passes)", () => {
     lastMessage(workerSessionId, "assistant", [{ type: "text", text: "Insufficient quota for model deepseek-v4-flash" }], 30_000);
     await rt.stalls.executeNext(swarmId);
 
-    const chatFailures = await chatFailureNotices(swarmId);
-    expect(chatFailures.length).toBe(1);
-    expect(chatFailures[0]!.body.text).toContain("hit auth");
-
-    const rt2 = await runtime();
-    const all = await rt2.store.listMessagesBySwarm(swarmId, 100);
-    const usageLimits = all.filter((m) => m.kind === "finding" && m.body.text.includes("[USAGE LIMIT]"));
-    expect(usageLimits.length).toBe(1);
-    expect(usageLimits[0]!.body.text).toContain("Insufficient quota");
+    // Both markers land in the same flushed digest (distinct channels kept).
+    const text = await chatFailureDigest(swarmId);
+    const chatFailureLines = text.split("\n").filter((l) => l.includes("[CHAT FAILURE]"));
+    expect(chatFailureLines.length).toBe(1);
+    expect(chatFailureLines[0]).toContain("hit auth");
+    const usageLimitLines = text.split("\n").filter((l) => l.includes("[USAGE LIMIT]"));
+    expect(usageLimitLines.length).toBe(1);
+    expect(usageLimitLines[0]).toContain("Insufficient quota");
   });
 });
 
@@ -379,11 +380,11 @@ describe("e. session.error event classification", () => {
     await handleOpenCodeEvent(rt, evt as never);
     await handleOpenCodeEvent(rt, evt as never); // same failure — deduped
 
-    const notices = await chatFailureNotices(swarmId);
-    expect(notices.length).toBe(1);
-    expect(notices[0]!.body.text).toContain("[CHAT FAILURE]");
-    expect(notices[0]!.body.text).toContain("member 'worker' hit auth");
-    expect(notices[0]!.body.text).toContain("remedy: check provider credentials");
+    const text = await chatFailureDigest(swarmId);
+    const chatFailureLines = text.split("\n").filter((l) => l.includes("[CHAT FAILURE]"));
+    expect(chatFailureLines.length).toBe(1);
+    expect(chatFailureLines[0]).toContain("member 'worker' hit auth");
+    expect(chatFailureLines[0]).toContain("remedy: check provider credentials");
   });
 
   test("session.error with a properties.message variant is classified too", async () => {
@@ -393,10 +394,11 @@ describe("e. session.error event classification", () => {
       type: "session.error",
       properties: { sessionID: workerSessionId, message: "Model not found: deepseek-v4-flash is not a valid model id" },
     } as never);
-    const notices = await chatFailureNotices(swarmId);
-    expect(notices.length).toBe(1);
-    expect(notices[0]!.body.text).toContain("hit model-not-found");
-    expect(notices[0]!.body.text).toContain("swarm_model(action: 'set'");
+    const text = await chatFailureDigest(swarmId);
+    const chatFailureLines = text.split("\n").filter((l) => l.includes("[CHAT FAILURE]"));
+    expect(chatFailureLines.length).toBe(1);
+    expect(chatFailureLines[0]).toContain("hit model-not-found");
+    expect(chatFailureLines[0]).toContain("swarm_model(action: 'set'");
   });
 
   test("a non-chat-failure session.error (abort) does not notify [CHAT FAILURE]", async () => {
@@ -406,7 +408,8 @@ describe("e. session.error event classification", () => {
       type: "session.error",
       properties: { sessionID: workerSessionId, error: "AbortError: The operation was aborted" },
     } as never);
-    expect(await chatFailureNotices(swarmId)).toEqual([]);
+    const text = await chatFailureDigest(swarmId);
+    expect(text.includes("[CHAT FAILURE]")).toBe(false);
   });
 });
 

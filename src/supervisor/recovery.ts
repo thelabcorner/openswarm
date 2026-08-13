@@ -56,6 +56,10 @@ export class Recovery {
       // The coordinator is the user's own session — never respawned by the
       // swarm; only worker members are re-created after a restart.
       if (member.role === "coordinator") continue;
+      // GUESTS (t-guest-messaging): role 'guest' rows back a NON-swarm chat
+      // session — the user's own conversation. Never respawned or status-
+      // corrected by recovery: their session is not a swarm child.
+      if (member.role === "guest") continue;
 
       // Presence is determined by session EXISTENCE, not status: idle sessions
       // drop out of the status map, so getStatus() returning null does NOT mean

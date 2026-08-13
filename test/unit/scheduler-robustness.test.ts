@@ -168,11 +168,16 @@ async function claimTaskFor(rt: SwarmPluginRuntime, swarmId: string, taskId: str
   await rt.store.updateMemberStatus(memberId, "working", { currentTaskId: taskId, lastActiveAt: Date.now() });
 }
 
-/** Coordinator [PERMISSION ALLOWED] advisory findings for a swarm. */
-async function allowAllAdvisories(swarmId: string) {
-  const rt = await runtime();
-  const all = await rt.store.listMessagesBySwarm(swarmId, 100);
-  return all.filter((m) => m.kind === "finding" && m.body.text.includes("[PERMISSION ALLOWED]"));
+/** Coordinator advisory DIGEST lines for a swarm (t-flood-aggregate: advisories
+ * are delivered as lines of the debounced coordinator digest instead of
+ * mailbox findings). Forces a flush, then reads the coordinator session's
+ * promptAsync turns for the marker — counting digest LINES, not turns. */
+async function advisoryDigestLines(rt: SwarmPluginRuntime, swarmId: string, coordSession: string, marker: string): Promise<string[]> {
+  await rt.notices.flush(swarmId);
+  return promptCalls
+    .filter((c) => c.sessionID === coordSession)
+    .flatMap((c) => c.text.split("\n"))
+    .filter((l) => l.includes(marker));
 }
 
 afterAll(async () => {
@@ -183,7 +188,7 @@ afterAll(async () => {
 describe("t-sched-robustness (a) — [object Object] notice normalization", () => {
   test("session.error with an OBJECT error payload -> coordinator notice readable, never '[object Object]'", async () => {
     await initPlugin();
-    const { rt, swarmId, coordSession, workerSessions, workerMembers } = await makeSwarmWithWorkers("sr-a");
+    const { rt, swarmId, coordSession, workerSessions, workerMembers } = await makeSwarmWithWorkers("sr-a", 1, { noticeFlushMs: 50 });
     const workerSession = workerSessions[0]!;
     await claimTaskFor(rt, swarmId, "TA-obj", workerMembers[0]!.id, "object error task");
 
@@ -192,8 +197,9 @@ describe("t-sched-robustness (a) — [object Object] notice normalization", () =
       properties: { sessionID: workerSession, error: { name: "ProviderError", message: "upstream timeout" } },
     } as never);
 
-    // The coordinator notice is debounced ~1.5s inside notifyCoordinator.
-    await new Promise((r) => setTimeout(r, 2100));
+    // The coordinator notice is debounced into the notice aggregator's digest
+    // (t-flood-aggregate; flush window set to 50ms via policies above).
+    await new Promise((r) => setTimeout(r, 300));
     const coordNotices = promptCalls.filter((c) => c.sessionID === coordSession);
     expect(coordNotices.length).toBeGreaterThan(0);
     const notice = coordNotices.map((c) => c.text).join("\n");
@@ -207,12 +213,12 @@ describe("t-sched-robustness (a) — [object Object] notice normalization", () =
 
   test("session.error with a STRING error payload still renders normally", async () => {
     await initPlugin();
-    const { rt, swarmId, coordSession, workerSessions } = await makeSwarmWithWorkers("sr-a2");
+    const { rt, swarmId, coordSession, workerSessions } = await makeSwarmWithWorkers("sr-a2", 1, { noticeFlushMs: 50 });
     await handleOpenCodeEvent(rt, {
       type: "session.error",
       properties: { sessionID: workerSessions[0]!, error: "rate limited" },
     } as never);
-    await new Promise((r) => setTimeout(r, 2100));
+    await new Promise((r) => setTimeout(r, 300));
     const notice = promptCalls.filter((c) => c.sessionID === coordSession).map((c) => c.text).join("\n");
     expect(notice).toContain("rate limited");
     expect(notice).not.toContain("[object Object]");
@@ -415,7 +421,7 @@ describe("t-sched-robustness (d) — respawned taskless member returns IDLE", ()
 describe("t-sched-robustness (e) — advisory flood cap", () => {
   test("N asks in the window -> exactly 1 advisory per member; per-swarm cap 3; window resets", async () => {
     await initPlugin(true); // allowAllMemberPermissions so high-risk asks auto-allow
-    const { rt, swarmId, workerSessions, workerMembers } = await makeSwarmWithWorkers("sr-e", 4);
+    const { rt, swarmId, coordSession, workerSessions, workerMembers } = await makeSwarmWithWorkers("sr-e", 4);
     const [sa, sb, sc, sd] = workerSessions;
     const [ma, mb, mc, md] = workerMembers;
 
@@ -428,7 +434,9 @@ describe("t-sched-robustness (e) — advisory flood cap", () => {
       );
       expect(out.status).toBe("allow"); // the CAP suppresses the notice, never the allow
     }
-    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
+    // The allowed advisory lands as ONE [PERMISSION ALLOWED] digest line.
+    let advisoryLines = await advisoryDigestLines(rt, swarmId, coordSession, "[PERMISSION ALLOWED]");
+    expect(advisoryLines.length).toBe(1);
 
     // Per-swarm cap: members b and c each get their own 1 (swarm total 3);
     // member d's first ask is SUPPRESSED (swarm cap 3/5min).
@@ -440,7 +448,8 @@ describe("t-sched-robustness (e) — advisory flood cap", () => {
       );
       expect(out.status).toBe("allow");
     }
-    expect((await allowAllAdvisories(swarmId)).length).toBe(3);
+    advisoryLines = await advisoryDigestLines(rt, swarmId, coordSession, "[PERMISSION ALLOWED]");
+    expect(advisoryLines.length).toBe(3);
 
     // Member 'a' again (new id) — still suppressed by the per-member cap.
     const again = askOutput();
@@ -449,7 +458,8 @@ describe("t-sched-robustness (e) — advisory flood cap", () => {
       again,
     );
     expect(again.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(3);
+    advisoryLines = await advisoryDigestLines(rt, swarmId, coordSession, "[PERMISSION ALLOWED]");
+    expect(advisoryLines.length).toBe(3);
 
     // Window reset: clear the in-memory caps (a new 5-min window) -> member 'a'
     // may notify again, and the swarm counter restarts.
@@ -461,12 +471,13 @@ describe("t-sched-robustness (e) — advisory flood cap", () => {
       afterReset,
     );
     expect(afterReset.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(4);
+    advisoryLines = await advisoryDigestLines(rt, swarmId, coordSession, "[PERMISSION ALLOWED]");
+    expect(advisoryLines.length).toBe(4);
   });
 
   test("[CHAT FAILURE] advisories are capped the same way (1 per member per window)", async () => {
     await initPlugin();
-    const { rt, swarmId, workerSessions } = await makeSwarmWithWorkers("sr-e2", 1);
+    const { rt, swarmId, coordSession, workerSessions } = await makeSwarmWithWorkers("sr-e2", 1);
     const workerSession = workerSessions[0]!;
     const member = await rt.store.getMemberBySessionId(workerSession);
     if (!member) throw new Error("worker not found");
@@ -484,9 +495,10 @@ describe("t-sched-robustness (e) — advisory flood cap", () => {
       reason: "provider-error", subtype: "context", stallMs: 0,
       evidence: ["chat failure: context — too long"], nextAction: "provider-error-notify", recipe: "compact",
     });
-    const all = await rt.store.listMessagesBySwarm(swarmId, 100);
-    const chatFailures = all.filter((m) => m.kind === "finding" && m.body.text.includes("[CHAT FAILURE]"));
-    expect(chatFailures.length).toBe(1);
-    expect(chatFailures[0]!.body.text).toContain("hit auth");
+    // Exactly ONE [CHAT FAILURE] digest line (the second is suppressed and
+    // counted into '+N suppressed' by the aggregator).
+    const chatFailureLines = await advisoryDigestLines(rt, swarmId, coordSession, "[CHAT FAILURE]");
+    expect(chatFailureLines.length).toBe(1);
+    expect(chatFailureLines[0]).toContain("hit auth");
   });
 });

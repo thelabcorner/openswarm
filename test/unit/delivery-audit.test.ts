@@ -323,6 +323,10 @@ describe("delivery-error SURFACING to the coordinator (t-perm-delivery fix)", ()
         name: `surface-${Math.random().toString(36).slice(2, 8)}`,
         projectId: "proj",
         coordinatorSessionId: "ses-sf-coord",
+        // t-flood-aggregate: the delivery-failure notice routes through the
+        // notice aggregator; a short flush window keeps the test fast (the
+        // default digest window is 5s).
+        policies: { noticeFlushMs: 50 },
       });
       const worker = await rt.core.spawnMember({ swarmId: swarm.id, name: "w1", role: "r" });
 
@@ -346,8 +350,9 @@ describe("delivery-error SURFACING to the coordinator (t-perm-delivery fix)", ()
         message: "ping that will fail delivery",
       });
 
-      // notifyCoordinator batches with a 1500ms debounce — wait it out.
-      await new Promise((r) => setTimeout(r, 1800));
+      // The notice is debounced into the notice aggregator's digest (flush
+      // window set to 50ms above) — wait it out.
+      await new Promise((r) => setTimeout(r, 500));
       expect(prompts.length).toBe(1);
       expect(prompts[0]!.sessionID).toBe("ses-sf-coord");
       expect(prompts[0]!.text).toContain("mailbox delivery to member 'w1' FAILED");

@@ -313,7 +313,10 @@ export class Scheduler {
       // must NOT receive a new assignment — its old task is still owned and
       // would strand, and its currentTaskId would be silently overwritten.
       // Only genuinely idle, unowned members are assignment candidates.
-      .filter((m) => m.status === "idle" && m.role !== "coordinator" && !m.currentTaskId && !isChatting(m, swarm))
+      // GUEST EXCLUSION (t-guest-messaging): role 'guest' members are external
+      // non-swarm sessions (the user's own chats) — they must NEVER be assigned
+      // tasks, alone or alongside workers.
+      .filter((m) => m.status === "idle" && m.role !== "coordinator" && m.role !== "guest" && !m.currentTaskId && !isChatting(m, swarm))
       .sort((a, b) => a.name.localeCompare(b.name));
     const memberByName = new Map(members.map((m) => [m.name, m]));
     const idleById = new Map(idle.map((m) => [m.id, m]));
@@ -505,7 +508,8 @@ export class Scheduler {
     // respawn) must NEVER receive a task by affinity. Defense-in-depth: the
     // idle filter already excludes them, but the scoring path filters again so
     // no future idle-filter change can leak a non-resumable member into a
-    // candidate list.
+    // candidate list. Guests (role 'guest', t-guest-messaging) are excluded
+    // here too — external non-swarm sessions never take tasks.
     const stop = NON_RESUMABLE;
     for (const task of ready) {
       const full = taskById.get(task.id);
@@ -513,7 +517,7 @@ export class Scheduler {
       const desc = (full?.description ?? task.description ?? "").toLowerCase();
       const hay = `${title} ${desc}`;
       const scored = idle
-        .filter((m) => !stop.has(m.status))
+        .filter((m) => !stop.has(m.status) && m.role !== "guest")
         .map((m) => ({
           member: m,
           score:

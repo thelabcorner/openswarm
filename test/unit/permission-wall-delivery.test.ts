@@ -178,11 +178,17 @@ async function permissionWallNotices(swarmId: string) {
   return all.filter((m) => m.kind === "finding" && m.body.text.includes("[PERMISSION WALL]"));
 }
 
-/** Allow-all high-risk advisory findings for a swarm (t-perm-trace remediation). */
-async function allowAllAdvisories(swarmId: string) {
+/** Allow-all high-risk advisory DIGEST lines for a swarm (t-flood-aggregate:
+ * advisories are delivered as lines of the debounced coordinator digest
+ * instead of mailbox findings). Forces a flush, then returns the coordinator
+ * session's digest LINES containing the marker (lines, not turns). */
+async function allowAllAdvisories(swarmId: string, coordSession: string): Promise<string[]> {
   const rt = await runtime();
-  const all = await rt!.store.listMessagesBySwarm(swarmId, 100);
-  return all.filter((m) => m.kind === "finding" && m.body.text.includes("[PERMISSION ALLOWED]"));
+  await rt!.notices.flush(swarmId);
+  return promptCalls
+    .filter((c) => c.sessionID === coordSession)
+    .flatMap((c) => c.text.split("\n"))
+    .filter((l) => l.includes("[PERMISSION ALLOWED]"));
 }
 
 /** promptAsync calls whose text is a permission-wall mailbox turn. */
@@ -308,25 +314,25 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
     // (1) bash "*" (would be gated without allow-all) -> allowed + advisory.
     const out1 = await askBashStar(workerSessionId, "perm-rem-1");
     expect(out1.status).toBe("allow");
-    let advisories = await allowAllAdvisories(swarmId);
+    let advisories = await allowAllAdvisories(swarmId, coordSession);
     expect(advisories.length).toBe(1);
-    expect(advisories[0]!.body.text).toContain("[PERMISSION ALLOWED]");
-    expect(advisories[0]!.body.text).toContain("member 'worker' requested bash");
-    expect(advisories[0]!.body.text).toContain("allowAllMemberPermissions");
-    expect(advisories[0]!.body.text).toContain("outside the member's trusted worktree scope");
-    expect(advisories[0]!.body.text).not.toContain("swarm_permissions(swarmId:"); // nothing to answer
+    expect(advisories[0]).toContain("[PERMISSION ALLOWED]");
+    expect(advisories[0]).toContain("member 'worker' requested bash");
+    expect(advisories[0]).toContain("allowAllMemberPermissions");
+    expect(advisories[0]).toContain("outside the member's trusted worktree scope");
+    expect(advisories[0]).not.toContain("swarm_permissions(swarmId:"); // nothing to answer
     // NOT a wall: still no pending record, no '[PERMISSION WALL]' finding.
     expect((await rt!.store.listPendingPermissions(swarmId)).length).toBe(0);
     expect((await permissionWallNotices(swarmId)).length).toBe(0);
-    // The advisory reached the coordinator's mailbox (promptAsync'd).
-    const advisoryCalls = promptCalls.filter((c) => c.text.includes("[PERMISSION ALLOWED]"));
+    // The advisory reached the coordinator session as a digest turn
+    // (promptAsync'd by the notice aggregator, not a mailbox finding).
+    const advisoryCalls = await allowAllAdvisories(swarmId, coordSession);
     expect(advisoryCalls.length).toBe(1);
-    expect(advisoryCalls[0]!.sessionID).toBe(coordSession);
 
     // (2) Same ask id again -> deduped (still exactly one advisory).
     const out1b = await askBashStar(workerSessionId, "perm-rem-1");
     expect(out1b.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
+    expect((await allowAllAdvisories(swarmId, coordSession)).length).toBe(1);
 
     // (3) A NEW high-risk ask (bash outside worktree) within the advisory
     // flood-cap window (t-sched-robustness): the member already got its ONE
@@ -341,7 +347,7 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
       out3,
     );
     expect(out3.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
+    expect((await allowAllAdvisories(swarmId, coordSession)).length).toBe(1);
 
     // (4) An IN-SCOPE ask (bash pattern inside the worktree ".") is allowed
     // WITHOUT an advisory (not high-risk — the normal scoping would allow it).
@@ -351,7 +357,7 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
       out4,
     );
     expect(out4.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
+    expect((await allowAllAdvisories(swarmId, coordSession)).length).toBe(1);
 
     // (5) Low-risk read ops stay silent under allow-all (not in the high-risk set).
     const out5 = askOutput();
@@ -360,14 +366,14 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
       out5,
     );
     expect(out5.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
+    expect((await allowAllAdvisories(swarmId, coordSession)).length).toBe(1);
 
     // Still nothing pending anywhere.
     expect((await rt!.store.listPendingPermissions(swarmId)).length).toBe(0);
   });
 
   test("USER REPRO: even under allow-all, an ask from an unresolvable member session (re-root) STILL WALLS — silently (no record, no notice)", async () => {
-    const { rt, swarmId, workerSessionId } = await makeSwarmWithWorker("pwt-b-stale");
+    const { rt, swarmId, coordSession, workerSessionId } = await makeSwarmWithWorker("pwt-b-stale");
     // allow-all only auto-allows asks whose session resolves to a member via
     // getMemberBySessionId. A re-rooted / re-created member session (new id,
     // never observed by the plugin) fails that lookup, so the ask is left
@@ -381,7 +387,7 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
     expect(out.status).toBe("ask");
     expect((await rt!.store.listPendingPermissions(swarmId)).length).toBe(0);
     expect((await permissionWallNotices(swarmId)).length).toBe(0);
-    expect((await allowAllAdvisories(swarmId)).length).toBe(0);
+    expect((await allowAllAdvisories(swarmId, coordSession)).length).toBe(0);
     expect(wallPromptCalls().length).toBe(0);
     // Sanity: the worker's own session is still auto-allowed under allow-all.
     const out2 = await askBashStar(workerSessionId, "perm-stale-b2");
