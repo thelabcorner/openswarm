@@ -1,4 +1,4 @@
-import type { AgentRuntime } from "../runtime/runtime-types.js";
+import type { AgentRuntime, RuntimeMessage } from "../runtime/runtime-types.js";
 import type { PendingPermission, Swarm, SwarmMember, SwarmTask } from "../core/types.js";
 import type { SwarmStore } from "../storage/store.js";
 import { fence } from "../core/fence.js";
@@ -21,6 +21,17 @@ import { fence } from "../core/fence.js";
  * reported to the coordinator — the diagnoser NEVER auto-changes models; the
  * coordinator decides via swarm_revive / a model change / waiting out the window).
  *
+ * Chat-failure detection (t-fail-detect): classifyFailure maps upstream/provider
+ * error text (invalid bearer credential / quota / rate-limit / model-not-found /
+ * context-length / 401/403/unauthorized / generic upstream failure) to a
+ * { reason, subtype, remedy } class. The diagnoser scans each WORKING member's
+ * LAST assistant message per pass (one getMessages fetch, shared with the
+ * liveness check) and surfaces reason 'provider-error' (subtype + remedy as the
+ * recipe) or 'usage-limit' (quota/rate → the existing usage-notify path).
+ * The ladder's provider-error-notify rung tells the coordinator via
+ * notifyProviderError (deduped per memberId+subtype), and the session.error
+ * event classifies the same text through handleOpenCodeEvent.
+ *
  * The diagnoser is a structural host (like ReviveEngine): the plugin injects a
  * StallHost (store + runtime + outward messaging actions) so this module never
  * imports plugin.ts and stays unit-testable with a fake host.
@@ -29,6 +40,7 @@ import { fence } from "../core/fence.js";
 export type StallReason =
   | "permission-wall"
   | "usage-limit"
+  | "provider-error"
   | "session-silent"
   | "session-absent"
   | "lease-stuck"
@@ -43,6 +55,7 @@ export type StallAction =
   | "nudge"
   | "permission-notify"
   | "usage-notify"
+  | "provider-error-notify"
   | "coordinator-blocker"
   | "release-task"
   | "respawn";
@@ -53,6 +66,9 @@ export interface StallDiagnosis {
   role: string;
   status: string;
   reason: StallReason;
+  /** Failure subtype for classified reasons (e.g. 'auth' for provider-error,
+   * 'quota'/'rate' for usage-limit) — t-fail-detect. */
+  subtype?: string;
   /** How long the member has been in this stalled state (ms). */
   stallMs: number;
   evidence: string[];
@@ -86,6 +102,113 @@ export interface UsageLimitRecord {
 export const USAGE_LIMIT_REMEDY = (swarmId: string, memberName: string): string =>
   `member '${memberName}' hit model usage limits — answer with swarm_revive(swarmId: '${swarmId}', action: 'revive', strategy: 'keep') / a model change, or wait for the limit window`;
 
+// ==== t-fail-detect: chat-failure classification (upstream/provider errors) ====
+
+/** Subtype of a classified chat failure — WHAT went wrong upstream. */
+export type ChatFailureSubtype =
+  | "auth"
+  | "quota"
+  | "rate"
+  | "model-not-found"
+  | "context"
+  | "other";
+
+/** Result of classifyFailure: the stall reason to surface + the exact remedy. */
+export interface ChatFailureClass {
+  reason: StallReason;
+  subtype: ChatFailureSubtype;
+  remedy: string;
+}
+
+/** A recorded chat failure for a member (per-swarm in-memory, like limits). */
+export interface ChatFailureRecord {
+  memberId: string;
+  subtype: ChatFailureSubtype;
+  reason: StallReason;
+  /** The raw failure text, truncated to 120 chars. */
+  snippet: string;
+  remedy: string;
+  at: number;
+}
+
+/** Remedy for auth failures (invalid bearer credential / 401 / 403 / unauthorized). */
+export const AUTH_FAILURE_REMEDY = "check provider credentials (opencode auth login / provider API key)";
+/** Remedy for quota/rate failures — the existing usage-limit answer. */
+export const LIMIT_FAILURE_REMEDY = "wait for the limit window / change model";
+/** Remedy for a vanished model — the exact swarm_model 'set' recipe (t-model-mgmt). */
+export const MODEL_NOT_FOUND_REMEDY =
+  "the member's model no longer exists — switch it: swarm_model(action: 'set', member: '<name>', model: { providerID, modelID })";
+/** Remedy for context-window overflows. */
+export const CONTEXT_FAILURE_REMEDY = "context too long — compact the session";
+/** Remedy for unclassified upstream failures. */
+export const OTHER_FAILURE_REMEDY = "check the provider status / credentials";
+
+/**
+ * t-fail-detect classifier: turn an upstream/provider chat-failure message
+ * into a { reason, subtype, remedy } stall class, or undefined when the text
+ * is not a chat failure (normal assistant text, aborts, network blips).
+ *
+ * Pattern order matters — the specific signals (invalid bearer credential,
+ * quota, rate-limit, model-not-found, context length, 401/403/unauthorized)
+ * win before the generic 'upstream request failed' catch-all. Quota/rate map
+ * to reason 'usage-limit' (the existing notify path); everything else is
+ * 'provider-error'.
+ */
+export function classifyFailure(message: string): ChatFailureClass | undefined {
+  if (typeof message !== "string" || message.trim() === "") return undefined;
+  const m = message;
+  if (/upstream request failed/i.test(m) && /invalid[_ ]bearer[_ ]credential/i.test(m)) {
+    return { reason: "provider-error", subtype: "auth", remedy: AUTH_FAILURE_REMEDY };
+  }
+  if (/insufficient[_ ]quota|quota exceeded/i.test(m)) {
+    return { reason: "usage-limit", subtype: "quota", remedy: LIMIT_FAILURE_REMEDY };
+  }
+  if (/rate.?limit/i.test(m)) {
+    return { reason: "usage-limit", subtype: "rate", remedy: LIMIT_FAILURE_REMEDY };
+  }
+  if (/model[_ ]not[_ ]found/i.test(m)) {
+    return { reason: "provider-error", subtype: "model-not-found", remedy: MODEL_NOT_FOUND_REMEDY };
+  }
+  if (/context[ _]length|maximum context/i.test(m)) {
+    return { reason: "provider-error", subtype: "context", remedy: CONTEXT_FAILURE_REMEDY };
+  }
+  if (/401|403|unauthorized/i.test(m)) {
+    return { reason: "provider-error", subtype: "auth", remedy: AUTH_FAILURE_REMEDY };
+  }
+  if (/upstream request failed/i.test(m)) {
+    return { reason: "provider-error", subtype: "other", remedy: OTHER_FAILURE_REMEDY };
+  }
+  return undefined;
+}
+
+/** The LAST assistant message of a session (the surface where a provider
+ * failure appears), or undefined when there is no assistant turn yet. */
+export function lastAssistantMessage(msgs: RuntimeMessage[] | undefined): RuntimeMessage | undefined {
+  if (!Array.isArray(msgs)) return undefined;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "assistant") return msgs[i];
+  }
+  return undefined;
+}
+
+/** Concatenated text of a message's text/error/reasoning parts — the surfaces
+ * where an upstream failure message shows up. Returns undefined when empty. */
+export function extractMessageFailureText(msg: RuntimeMessage | undefined): string | undefined {
+  if (!msg || !Array.isArray(msg.parts)) return undefined;
+  const texts: string[] = [];
+  for (const p of msg.parts) {
+    if (!p || typeof p.text !== "string" || p.text.trim() === "") continue;
+    if (p.type === "text" || p.type === "error" || p.type === "reasoning") texts.push(p.text.trim());
+  }
+  const joined = texts.join("\n").trim();
+  return joined.length > 0 ? joined : undefined;
+}
+
+/** Truncate a failure snippet to 120 chars for evidence/notifications. */
+export function truncateFailure(s: string, max = 120): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
 /** Model usage-limit signal regex (go + free tiers): provider errors and
  * retry-status messages that indicate a limit/quota/rate/billing hit. */
 export const LIMIT_SIGNAL_RE = /limit|quota|rate|429|billing/i;
@@ -117,6 +240,7 @@ export const RESPAWN_DEDUP_MS = 5 * 60_000;
 const STALLED_REASONS: ReadonlySet<StallReason> = new Set([
   "permission-wall",
   "usage-limit",
+  "provider-error",
   "session-silent",
   "session-absent",
   "lease-stuck",
@@ -128,6 +252,7 @@ const FORCE_SEQUENCES: Record<StallReason, StallAction[]> = {
   "session-silent": ["nudge", "coordinator-blocker", "release-task"],
   "permission-wall": ["permission-notify", "coordinator-blocker", "release-task"],
   "usage-limit": ["usage-notify", "coordinator-blocker", "release-task"],
+  "provider-error": ["provider-error-notify", "coordinator-blocker", "release-task"],
   "lease-stuck": ["release-task"],
   "session-absent": ["respawn", "coordinator-blocker"],
   "chat-paused": [],
@@ -155,6 +280,11 @@ function stepFor(reason: StallReason, stallMs: number): { rung: number; action: 
     case "usage-limit":
       if (stallMs >= LADDER_BLOCKER_MS) return { rung: 3, action: "coordinator-blocker" };
       return { rung: 2, action: "usage-notify" };
+    case "provider-error":
+      // Nudging does not fix a provider failure — notify the coordinator
+      // immediately (mirrors usage-limit: the remedy is theirs to act on).
+      if (stallMs >= LADDER_BLOCKER_MS) return { rung: 3, action: "coordinator-blocker" };
+      return { rung: 2, action: "provider-error-notify" };
     case "lease-stuck":
       // The claim lease expired — the task is release-task material outright.
       return { rung: 4, action: "release-task" };
@@ -179,6 +309,10 @@ export interface StallHost {
   notifyPermissionWall(permission: PendingPermission, contextNote?: string): Promise<void>;
   /** Rung 2 (usage-limit): notify the coordinator with the remedy. */
   notifyUsageLimit(member: SwarmMember, record: UsageLimitRecord): Promise<void>;
+  /** Rung 2 (provider-error): notify the coordinator with the chat-failure
+   * remedy (t-fail-detect). The diagnoser never auto-changes models — the
+   * coordinator acts via the remedy (credentials / model switch / compaction). */
+  notifyProviderError(member: SwarmMember, diagnosis: StallDiagnosis): Promise<void>;
   /** Rung 3: the ONE "why is my swarm stuck" blocker to the coordinator. */
   notifyCoordinatorBlocker(swarm: Swarm, member: SwarmMember, diagnosis: StallDiagnosis): Promise<void>;
   /** Rung 4: release the member's task WITHOUT consuming the retry budget. */
@@ -202,6 +336,9 @@ export interface StallHost {
 export class StallDiagnoser {
   /** Per-swarm recorded usage-limit hits: swarmId -> memberId -> record. */
   private usageLimits = new Map<string, Map<string, UsageLimitRecord>>();
+  /** t-fail-detect: per-swarm recorded chat failures: swarmId -> memberId ->
+   * record (the provider-error-notify ladder action reads it). */
+  private chatFailures = new Map<string, Map<string, ChatFailureRecord>>();
   /** Per-member last nudge time (liveness exclusion + rung-1 dedup). */
   private lastNudgeAt = new Map<string, number>();
   /** Per-(member,reason) last notify time (rung-2 dedup). */
@@ -544,9 +681,20 @@ export class StallDiagnoser {
       return { ...base, reason: "stopped", stallMs: 0, evidence: ["member status is 'failed' (terminal)"], nextAction: "none", recipe: "(none — healthy)" };
     }
 
-    // 7. Working/claimed/starting — liveness via session messages.
+    // 7. Working/claimed/starting — liveness via session messages. t-fail-detect
+    // adds a chat-failure scan of the LAST assistant message FIRST (a provider
+    // failure is a more specific diagnosis than mere silence), with ONE
+    // getMessages fetch per pass reused for both the scan and liveness.
     if (["working", "claimed", "starting"].includes(m.status)) {
-      const live = await this.memberLiveness(m, now);
+      let msgs: RuntimeMessage[] | undefined;
+      try {
+        msgs = await this.host.runtimeAdapter.getMessages(m.sessionId);
+      } catch {
+        msgs = undefined; // best-effort — liveness still works on lastSeenActivity
+      }
+      const failure = await this.scanChatFailure(swarm, m, msgs, now);
+      if (failure) return failure;
+      const live = await this.memberLiveness(m, now, msgs);
       if (!live.silent) {
         return { ...base, reason: "working", stallMs: 0, evidence: ["session is producing activity"], nextAction: "none", recipe: "(none — healthy)" };
       }
@@ -580,15 +728,74 @@ export class StallDiagnoser {
     return { ...base, reason: "idle", stallMs: 0, evidence: [`status ${m.status}`], nextAction: "none", recipe: "(none — healthy)" };
   }
 
+  /**
+   * t-fail-detect SESSION SCAN: classify the member's LAST assistant message
+   * for an upstream/provider chat failure. When one matches, returns the full
+   * diagnosis (reason per the classifier, evidence 'chat failure: <subtype> —
+   * <snippet truncated 120 chars>', recipe = the remedy) and records the
+   * failure for the ladder's provider-error-notify action. Quota/rate
+   * classifications ALSO record a usage-limit signal so the existing
+   * usage-notify path fires. Never throws (the caller pre-fetches msgs inside
+   * a try/catch; a throw here is caught by the diagnose pass). One call per
+   * member per pass — no per-message re-scanning.
+   */
+  private async scanChatFailure(
+    swarm: Swarm,
+    m: SwarmMember,
+    msgs: RuntimeMessage[] | undefined,
+    now: number,
+  ): Promise<StallDiagnosis | undefined> {
+    const last = lastAssistantMessage(msgs);
+    const text = extractMessageFailureText(last);
+    if (!text) return undefined;
+    const cls = classifyFailure(text);
+    if (!cls) return undefined;
+    const snippet = truncateFailure(text);
+    const at = last?.createdAt ?? now;
+    const record: ChatFailureRecord = {
+      memberId: m.id,
+      subtype: cls.subtype,
+      reason: cls.reason,
+      snippet,
+      remedy: cls.remedy,
+      at,
+    };
+    let byMember = this.chatFailures.get(swarm.id);
+    if (!byMember) {
+      byMember = new Map();
+      this.chatFailures.set(swarm.id, byMember);
+    }
+    byMember.set(m.id, record);
+    // quota/rate → usage-limit: ALSO record the usage-limit signal so the
+    // ladder's usage-notify path (which reads usageLimits) fires for it.
+    if (cls.reason === "usage-limit") {
+      this.recordLimit(swarm.id, m.id, snippet, [`chat failure: ${cls.subtype} — ${snippet}`]);
+    }
+    const stallMs = Math.max(0, now - at);
+    const { action } = stepFor(cls.reason, stallMs);
+    return {
+      memberName: m.name,
+      role: m.role,
+      status: m.status,
+      reason: cls.reason,
+      subtype: cls.subtype,
+      stallMs,
+      evidence: [`chat failure: ${cls.subtype} — ${snippet}`],
+      nextAction: action,
+      recipe: cls.remedy,
+    };
+  }
+
   /** Liveness = newest session message (excluding this diagnoser's own nudges),
    * floored at the member's lastActiveAt/createdAt so a freshly claimed member
-   * mid-kickoff is not flagged silent (mirrors the plugin watchdog's grace). */
-  private async memberLiveness(m: SwarmMember, now: number): Promise<{ silent: boolean; anchor: number }> {
+   * mid-kickoff is not flagged silent (mirrors the plugin watchdog's grace).
+   * `preloaded` reuses the pass's single getMessages fetch (t-fail-detect). */
+  private async memberLiveness(m: SwarmMember, now: number, preloaded?: RuntimeMessage[]): Promise<{ silent: boolean; anchor: number }> {
     let latest = this.lastSeenActivity.get(m.id) ?? 0;
     const lastNudge = this.lastNudgeAt.get(m.id) ?? 0;
-    if (this.host.runtimeAdapter.getMessages) {
-      try {
-        const msgs = await this.host.runtimeAdapter.getMessages(m.sessionId);
+    try {
+      const msgs = preloaded ?? (this.host.runtimeAdapter.getMessages ? await this.host.runtimeAdapter.getMessages(m.sessionId) : undefined);
+      if (msgs) {
         for (let i = msgs.length - 1; i >= 0; i--) {
           const createdAt = msgs[i]?.createdAt;
           if (!createdAt) continue;
@@ -596,9 +803,9 @@ export class StallDiagnoser {
           latest = Math.max(latest, createdAt);
           break;
         }
-      } catch {
-        // leave latest as-is
       }
+    } catch {
+      // leave latest as-is
     }
     const anchor = Math.max(latest, m.lastActiveAt ?? m.createdAt ?? 0);
     const silent = now - anchor > STALL_SILENT_MS;
@@ -633,6 +840,14 @@ export class StallDiagnoser {
         this.lastNotifyAt.set(key, now);
         const rec = this.usageLimits.get(swarm.id)?.get(member.id);
         if (rec) await this.host.notifyUsageLimit(member, rec);
+        return !!rec;
+      }
+      case "provider-error-notify": {
+        if (!opts.force && now - (this.lastNotifyAt.get(key) ?? 0) < NOTIFY_DEDUP_MS) return false;
+        this.lastNotifyAt.set(key, now);
+        const rec = this.chatFailures.get(swarm.id)?.get(member.id);
+        // notifyProviderError dedupes internally per (memberId, subtype, 15 min).
+        if (rec) await this.host.notifyProviderError(member, d);
         return !!rec;
       }
       case "coordinator-blocker": {
@@ -682,6 +897,11 @@ export class StallDiagnoser {
         return `swarm_permissions(swarmId: '${swarm.id}', action: 'reply', permissionId: '${hint?.permissionId ?? "<pending id>"}', response: 'once' | 'always' | 'reject')`;
       case "usage-limit":
         return USAGE_LIMIT_REMEDY(swarm.id, member.name);
+      case "provider-error": {
+        // forceAdvance re-derives the recipe; fall back to the recorded remedy.
+        const rec = this.chatFailures.get(swarm.id)?.get(member.id);
+        return rec?.remedy ?? OTHER_FAILURE_REMEDY;
+      }
       case "session-silent":
         if (action === "nudge") return `swarm_wake(swarmId: '${swarm.id}', member: '${member.name}')`;
         if (action === "release-task") return `swarm_tasks(swarmId: '${swarm.id}', action: 'list') — task '${hint?.taskId ?? "<task>"}' released to ready`;
@@ -707,6 +927,8 @@ function causeRemedy(reason: StallReason): string {
       return `${reason}: answer the pending prompts via swarm_permissions reply`;
     case "usage-limit":
       return `${reason}: members hit model limits — swarm_revive / model change / wait for the limit window`;
+    case "provider-error":
+      return `${reason}: members hit upstream/provider chat failures — see the per-member remedy (credentials / model switch / compaction)`;
     case "session-silent":
       return `${reason}: members silent — the escalation ladder nudges → blocks → releases`;
     case "session-absent":

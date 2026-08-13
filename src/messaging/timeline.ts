@@ -108,6 +108,11 @@ function humanSentence(ev: SwarmEvent, ctx: TimelineContext): string {
       return `${actor} went idle`;
     case "member.respawned":
       return `${actor} was respawned after a restart${p.taskId ? ` (task ${String(p.taskId)})` : ""}`;
+    case "member.model_changed": {
+      const model = p.model as { providerID?: string; modelID?: string } | undefined;
+      const modelText = model?.providerID && model?.modelID ? `${model.providerID}/${model.modelID}` : String(p.model ?? "?");
+      return `${actor} changed the member's model to ${modelText}${p.auto ? " (auto — changed in the session)" : ""}`;
+    }
     case "task.claimed":
       return `${actor} claimed task ${taskRef(ctx, ev.entityId)}`;
     case "task.completed":

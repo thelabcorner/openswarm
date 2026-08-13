@@ -135,6 +135,7 @@ function makeStallHost(rt: any, fakeNowRef: { v: number }) {
     nudgeMember: async () => { calls.push("nudge"); },
     notifyPermissionWall: async () => { calls.push("permission-notify"); },
     notifyUsageLimit: async () => { calls.push("usage-notify"); },
+    notifyProviderError: async () => { calls.push("provider-error-notify"); },
     notifyCoordinatorBlocker: async () => { calls.push("blocker"); },
     releaseMemberTask: async (m) => {
       calls.push("release");

@@ -1,6 +1,6 @@
 {
   "name": "openswarm",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "type": "module",
   "description": "Plugin-only multi-agent collaboration for OpenCode: durable swarms of native OpenCode sessions.",
   "license": "MIT",

@@ -471,6 +471,16 @@ export class ChunkDbStore implements SwarmStore {
     });
   }
 
+  async updateMemberModel(memberId: string, model: { providerID: string; modelID: string } | undefined): Promise<void> {
+    return this.serialized(async () => {
+      const member = this.findGlobal<SwarmMember>(NS.member, memberId);
+      if (!member) return;
+      member.model = model;
+      member.updatedAt = Date.now();
+      this.putOne(NS.member, member.swarmId, member.id, member);
+    });
+  }
+
   // ==== tasks ====
 
   async insertTask(t: NewTask): Promise<SwarmTask> {

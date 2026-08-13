@@ -10,7 +10,7 @@ import { OpenCodeRuntime, type OpenCodeClientLikeV2 } from "./runtime/opencode-r
 import { SwarmCore, BlackboardConflict, swarmTaskLeaseMs, detectAckReply } from "./core/swarm.js";
 import { Supervisor } from "./supervisor/supervisor.js";
 import { Recovery } from "./supervisor/recovery.js";
-import { StallDiagnoser } from "./supervisor/stalls.js";
+import { StallDiagnoser, classifyFailure } from "./supervisor/stalls.js";
 import type { StallDiagnosis, StallHost, UsageLimitRecord } from "./supervisor/stalls.js";
 import { Broker } from "./messaging/broker.js";
 import { Scheduler } from "./scheduler/scheduler.js";
@@ -60,6 +60,12 @@ const PERMISSION_LIFECYCLE_EVENT_TYPES: ReadonlySet<string> = new Set([
  * diagnose pass can never hammer the server (the 10s stall sweep is the
  * natural cadence; this bounds faster manual diagnose calls). */
 const PERM_POLL_THROTTLE_MS = 5_000;
+
+/** t-fail-detect dedup window: ONE [CHAT FAILURE] notification per
+ * (memberId, subtype) per window — a session.error event and the stall
+ * ladder scan the same failure, so the coordinator is never double-notified
+ * (mirrors the notifiedPermissionIds once-per-prompt guarantee). */
+const PROVIDER_ERROR_NOTIFY_DEDUP_MS = 15 * 60_000;
 
 /** Truncate long blackboard values in list/search output so the tool stays
  * readable while still surfacing content (premium UX: a member can see what a
@@ -476,6 +482,11 @@ export class SwarmPluginRuntime implements StallHost {
    * escalation): ONE notification per pending prompt, never more — a re-raise
    * of the same prompt (same ask id) must not spam the coordinator. */
   private notifiedPermissionIds = new Set<string>();
+  /** t-fail-detect: per-(memberId, subtype) last [CHAT FAILURE] notify time —
+   * ONE notification per failure class per PROVIDER_ERROR_NOTIFY_DEDUP_MS
+   * window, so the session.error event and the stall ladder's scan (which both
+   * see the same failure) never double-notify the coordinator. */
+  private notifiedProviderErrors = new Map<string, number>();
   /** t-perm-trace: permission ids already surfaced as allow-all high-risk
    * advisories — ONE advisory per ask id, never more (a re-raise of the same
    * ask must not re-notify). */
@@ -2012,6 +2023,39 @@ export class SwarmPluginRuntime implements StallHost {
       ].join("\n"),
     }).catch((err) => {
       console.error(`[swarm] usage-limit notice to coordinator failed:`, err);
+    });
+  }
+
+  /**
+   * t-fail-detect (StallHost rung 2 for provider-error): notify the swarm
+   * coordinator that a member hit an upstream/provider chat failure (auth /
+   * quota / rate / model-not-found / context / other). Deduped per
+   * (memberId, subtype) within PROVIDER_ERROR_NOTIFY_DEDUP_MS — the session
+   * .error event and the stall ladder both see the same failure, so exactly
+   * ONE notification per failure class per window reaches the coordinator.
+   * The diagnosis carries the fenced snippet + the exact remedy to act on.
+   */
+  async notifyProviderError(member: SwarmMember, diagnosis: StallDiagnosis): Promise<void> {
+    const subtype = diagnosis.subtype ?? "other";
+    const key = `${member.id}:${subtype}`;
+    const now = Date.now();
+    const last = this.notifiedProviderErrors.get(key) ?? 0;
+    if (now - last < PROVIDER_ERROR_NOTIFY_DEDUP_MS) return;
+    this.notifiedProviderErrors.set(key, now);
+    const swarm = await this.store.getSwarm(member.swarmId);
+    if (!swarm) return;
+    const coordMember = await this.store.getMemberById(swarm.coordinatorMemberId);
+    const snippet = diagnosis.evidence[0]?.replace(/^chat failure: /, "") ?? "(unknown)";
+    await this.core.sendMessage({
+      swarmId: member.swarmId,
+      fromMemberId: member.id,
+      to: coordMember?.name ?? "coordinator",
+      kind: "finding",
+      priority: "high",
+      noreply: true,
+      message: `[CHAT FAILURE] member '${member.name}' hit ${subtype}: ${fence(snippet)} — remedy: ${diagnosis.recipe}`,
+    }).catch((err) => {
+      console.error(`[swarm] chat-failure notice to coordinator failed:`, err);
     });
   }
 
@@ -4254,6 +4298,7 @@ export async function swarmPlugin(
           for (const m of members) {
             const task = m.currentTaskId ? taskTitle.get(m.currentTaskId) ?? m.currentTaskId : "";
             let line = `  ${m.name}${m.role && m.role !== m.name ? ` (${m.role})` : ""}: ${m.status}${task ? ` — ${task}` : ""}`;
+            line += m.model ? ` — model ${m.model.providerID}/${m.model.modelID}` : " — model default";
             if (swarm && await rt.humanChat.chatting(m, swarm)) line += " 👤 chatting";
             lines.push(line);
           }
@@ -4567,6 +4612,7 @@ export async function swarmPlugin(
           lines.push(`  ${await rt.permsDiagnosticsForSwarm(args.swarmId)}`);
           for (const m of members) {
             let line = `  ${m.name.padEnd(12)} ${m.status.padEnd(10)} task=${m.currentTaskId ?? "-"}`;
+            line += m.model ? ` model=${m.model.providerID}/${m.model.modelID}` : " model=default";
             if (await rt.humanChat.chatting(m, swarm)) line += " 👤 chatting";
             lines.push(line);
           }
@@ -5300,17 +5346,126 @@ export async function swarmPlugin(
         },
       }),
 
+      swarm_model: tool({
+        description: [
+          "Easily switch a swarm member's model (or read the current one).",
+          "  action 'show' — ANY member may read the CURRENT model of any member",
+          "                  (omit `member` to list every member). Renders member +",
+          "                  model, or 'default (unset)' when the row has no model.",
+          "  action 'set'  — COORDINATOR-ONLY (the authority for the member's work).",
+          "                  Validates the model ref (tier labels accepted, e.g.",
+          "                  providerID 'go' -> 'opencode-go'; a modelID-only ref",
+          "                  resolves across providers), updates the member row so",
+          "                  subsequent prompts use it, records it as last-used,",
+          "                  notifies the member, and writes a timeline event.",
+          "Invalid refs are rejected with the right usage — nothing is changed.",
+        ].join("\n"),
+        args: {
+          swarmId: tool.schema.string().describe("Swarm id or name."),
+          action: tool.schema.enum(["set", "show"]).describe("Action."),
+          member: tool.schema.string().optional().describe("Member name (or id). Required for set; optional for show (defaults to all members)."),
+          model: tool.schema.object({
+            providerID: tool.schema.string().optional().describe("Provider id (tier labels like 'go' accepted). Optional — a modelID-only ref resolves across providers."),
+            modelID: tool.schema.string().describe("Model id (or display name)."),
+          }).optional().describe("Required for set — the model to assign the member."),
+        },
+        async execute(args, ctx) {
+          const rt = await ensureRt();
+          const core = rt.core;
+          args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
+          // Multi-own (migration v12): the caller's row within THIS swarm.
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) return { output: "calling session is not a member of this swarm" };
+
+          // ==== show — any member may read the current model of any member ====
+          if (args.action === "show") {
+            const members = args.member
+              ? [await core.store.getMemberByName(args.swarmId, args.member) ?? await core.store.getMemberById(args.member)]
+              : await core.store.listMembers(args.swarmId);
+            const rows = members.filter((m): m is NonNullable<typeof m> => !!m);
+            if (args.member && rows.length === 0) {
+              return { output: `no member '${args.member}' in this swarm` };
+            }
+            const lines = rows.map((m) =>
+              m.model
+                ? `  ${m.name} — model ${m.model.providerID}/${m.model.modelID} (set)`
+                : `  ${m.name} — model default (unset — resolved at spawn: requested > last-used > coordinator > default > fallback)`,
+            );
+            return { output: args.member ? lines[0]! : `${rows.length} member(s):\n${lines.join("\n")}` };
+          }
+
+          // ==== set — coordinator of THIS swarm only ====
+          if (caller.role !== "coordinator") {
+            return { output: `swarm_model set is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
+          }
+          if (!args.member) return { output: "set requires member (name or id)" };
+          if (!args.model) {
+            return { output: "set requires model: { providerID?, modelID } — e.g. { providerID: 'go', modelID: 'deepseek-v4-flash' } or { modelID: 'deepseek-v4-flash' }" };
+          }
+          const member = (await core.store.getMemberByName(args.swarmId, args.member)) ?? (await core.store.getMemberById(args.member));
+          if (!member) return { output: `no member '${args.member}' in this swarm` };
+
+          // Validate the ref against available models (tier labels + modelID-only
+          // resolved by the smart resolveModel). Invalid -> clear error, nothing changed.
+          const resolved = await rt.resolveModel({ providerID: args.model.providerID, modelID: args.model.modelID });
+          if (!resolved) {
+            const given = args.model.providerID || args.model.modelID
+              ? `${args.model.providerID?.trim() || "?"}/${args.model.modelID?.trim() || "?"}`
+              : "(empty)";
+            return {
+              output:
+                `invalid model '${given}' — no available model matches.\n` +
+                `Usage: swarm_model(swarmId: '${args.swarmId}', action: 'set', member: '${member.name}', model: { providerID: 'opencode-go', modelID: 'deepseek-v4-flash' })\n` +
+                `  providerID is optional (a modelID-only ref resolves across providers); tier labels are accepted ('go' -> 'opencode-go'). ` +
+                `Check available models via swarm_models.`,
+            };
+          }
+
+          // Persist the member row, record last-used, notify the member, timeline.
+          await core.store.updateMemberModel(member.id, resolved);
+          await rt.recordUsedModel(args.swarmId, resolved);
+          await core.sendMessage({
+            swarmId: args.swarmId,
+            fromMemberId: caller.id,
+            to: member.name,
+            kind: "finding",
+            priority: "high",
+            noreply: true,
+            message: `Your model changed to ${resolved.providerID}/${resolved.modelID} — subsequent prompts use it.`,
+          }).catch((err) => {
+            console.error(`[swarm] model-change notice to ${member.name} failed:`, err);
+          });
+          await core.store.insertEvent({
+            swarmId: args.swarmId,
+            type: "member.model_changed",
+            actorMemberId: caller.id,
+            entityType: "member",
+            entityId: member.id,
+            payloadJson: JSON.stringify({ model: resolved }),
+            createdAt: Date.now(),
+          }).catch((err) => {
+            console.warn(`[swarm] member.model_changed event recording failed: ${(err as Error).message}`);
+          });
+          return {
+            output: `member '${member.name}' model set to ${resolved.providerID}/${resolved.modelID} — next prompt uses it; last-used updated`,
+          };
+        },
+      }),
+
       swarm_stalls: tool({
         description: [
           "Stall auto-diagnosis + escalation ladder (the ONE 'why is my swarm stuck' answer).",
           "Unifies the watchdog (silent sessions), permission walls, expired task leases,",
-          "and model usage-limit hits into one per-member classifier.",
+          "model usage-limit hits, and upstream/provider chat failures (t-fail-detect:",
+          "auth / quota / rate / model-not-found / context / other) into one per-member",
+          "classifier.",
           "  action 'report'  read-only: swarm verdict (healthy|stalled), per-member",
           "                   diagnosis (reason, stallMs, evidence, next ladder action)",
           "                   with the EXACT resolving recipe, plus recorded usage-limit hits.",
           "  action 'ladder'  COORDINATOR-ONLY: force-advance a named member ONE rung",
-          "                   now (nudge -> permission/usage notify -> coordinator blocker",
-          "                   -> release-task / respawn), bypassing time + dedup windows.",
+          "                   now (nudge -> permission/usage/provider-error notify ->",
+          "                   coordinator blocker -> release-task / respawn), bypassing",
+          "                   time + dedup windows.",
           "report is available to any swarm member; ladder is coordinator-only.",
         ].join("\n"),
         args: {
@@ -5340,7 +5495,7 @@ export async function swarmPlugin(
             for (const d of report.members) {
               const stalled = d.nextAction !== "none";
               lines.push(
-                `  ${d.memberName} (${d.role}) — ${d.status} — ${d.reason}${d.stallMs > 0 ? ` (stalled ~${Math.round(d.stallMs / 1000)}s)` : ""} — next: ${d.nextAction}`,
+                `  ${d.memberName} (${d.role}) — ${d.status} — ${d.reason}${d.subtype ? ` (${d.subtype})` : ""}${d.stallMs > 0 ? ` (stalled ~${Math.round(d.stallMs / 1000)}s)` : ""} — next: ${d.nextAction}`,
               );
               for (const e of d.evidence) lines.push(`      evidence: ${e}`);
               if (stalled) lines.push(`      resolve: ${d.recipe}`);
@@ -5745,6 +5900,64 @@ export async function handleOpenCodeEvent(
   //                  heal the member's sessionId mapping + record
   //                  'member.rerooted' so subsequent asks resolve in the store.
 
+  // (e) session.updated — model auto-sync (t-model-mgmt). When the USER changes
+  // a member's model in the chat composer, OpenCode emits session.updated with
+  // the new model on properties.info (the Session object — its id field is
+  // `id`, per @opencode-ai/sdk types.gen.d.ts). Sync the member row so spawns
+  // / display / the roster all see the same model, record it as last-used,
+  // write a timeline event, and notify the member. Events WITHOUT a concrete
+  // model are ignored (the plugin's own prompts fire without a session model),
+  // and only actual diffs act (dedup).
+  if (event.type === "session.updated") {
+    const info = ((event.properties as { info?: unknown })?.info ?? {}) as {
+      id?: string;
+      sessionID?: string;
+      model?: { providerID?: string; modelID?: string };
+    };
+    const sessionID = info.id ?? info.sessionID;
+    const newModel = info.model;
+    if (sessionID && newModel?.providerID && newModel?.modelID) {
+      try {
+        const member = await store.getMemberBySessionId(sessionID);
+        if (member) {
+          const cur = member.model;
+          const differs = !cur || cur.providerID !== newModel.providerID || cur.modelID !== newModel.modelID;
+          if (differs) {
+            const resolved = { providerID: newModel.providerID, modelID: newModel.modelID };
+            await store.updateMemberModel(member.id, resolved);
+            await rt.recordUsedModel(member.swarmId, resolved);
+            await store.insertEvent({
+              swarmId: member.swarmId,
+              type: "member.model_changed",
+              entityType: "member",
+              entityId: member.id,
+              payloadJson: JSON.stringify({ model: resolved, auto: true }),
+              createdAt: Date.now(),
+            }).catch((err) => {
+              console.warn(`[swarm] auto model-sync event recording failed: ${(err as Error).message}`);
+            });
+            const swarm = await store.getSwarm(member.swarmId);
+            if (swarm) {
+              await core.sendMessage({
+                swarmId: member.swarmId,
+                fromMemberId: swarm.coordinatorMemberId,
+                to: member.name,
+                kind: "finding",
+                priority: "high",
+                noreply: true,
+                message: `Your model was updated to ${resolved.providerID}/${resolved.modelID} (changed in the session).`,
+              }).catch((err) => {
+                console.error(`[swarm] auto model-sync notice to ${member.name} failed:`, err);
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[swarm] session.updated model sync failed:`, err);
+      }
+    }
+  }
+
   // (c) V1 replied — legacy bookkeeping: the USER answered in the app, mark
   // the recorded pending prompt replied so it stops appearing in
   // swarm_permissions list (the member is unblocked — the prompt never
@@ -5814,6 +6027,47 @@ export async function handleOpenCodeEvent(
   if (evtSessionID) {
     if (event.type === "session.error" || event.type === "session.deleted") {
       await rt.humanChat.clear(evtSessionID);
+    }
+    // t-fail-detect (session.error EVENT): classify the error text
+    // (properties.message, else properties.error, else the normalized payload)
+    // with classifyFailure and notify the coordinator ONCE per failure class
+    // (deduped inside notifyProviderError by memberId+subtype, so the stall
+    // ladder's scan of the same failure never double-notifies). Abort/cancel/
+    // interrupted payloads are not chat failures — classifyFailure returns
+    // undefined for them, so a manual stop stays silent here.
+    if (event.type === "session.error") {
+      const errProps = event.properties as { error?: unknown; message?: unknown };
+      const member = await store.getMemberBySessionId(evtSessionID);
+      if (member && member.role !== "coordinator") {
+        const raw = errProps.message ?? errProps.error;
+        const text =
+          (typeof errProps.message === "string" && errProps.message.trim()
+            ? errProps.message.trim()
+            : typeof errProps.error === "string" && errProps.error.trim()
+              ? errProps.error.trim()
+              : errorText(raw));
+        const cls = classifyFailure(text);
+        if (cls) {
+          const swarm = await store.getSwarm(member.swarmId);
+          if (swarm && swarm.status === "active") {
+            const snippet = text.length > 120 ? `${text.slice(0, 120)}…` : text;
+            const diagnosis: StallDiagnosis = {
+              memberName: member.name,
+              role: member.role,
+              status: member.status,
+              reason: cls.reason,
+              subtype: cls.subtype,
+              stallMs: 0,
+              evidence: [`chat failure: ${cls.subtype} — ${snippet}`],
+              nextAction: cls.reason === "usage-limit" ? "usage-notify" : "provider-error-notify",
+              recipe: cls.remedy,
+            };
+            await rt.notifyProviderError(member, diagnosis).catch((err) => {
+              console.error(`[swarm] session.error chat-failure notify failed:`, err);
+            });
+          }
+        }
+      }
     }
   }
 

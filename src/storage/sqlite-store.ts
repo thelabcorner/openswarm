@@ -1035,6 +1035,7 @@ export class SQLiteStore implements SwarmStore {
   removeSubscription(subscriptionId: string): Promise<void> { return this.serialized(() => this.tx.removeSubscription(subscriptionId)); }
   updateMemberStatus(memberId: string, status: SwarmMember["status"], fields?: Partial<Pick<SwarmMember, "lastActiveAt">> & { currentTaskId?: string | null }): Promise<void> { return this.serialized(() => this.tx.updateMemberStatus(memberId, status, fields)); }
   updateMemberHumanChat(memberId: string, humanChatAt: number | null): Promise<void> { return this.serialized(() => this.tx.updateMemberHumanChat(memberId, humanChatAt)); }
+  updateMemberModel(memberId: string, model: { providerID: string; modelID: string } | undefined): Promise<void> { return this.serialized(() => this.tx.updateMemberModel(memberId, model)); }
   claimTask(taskId: string, memberId: string, leaseMs?: number): Promise<boolean> { return this.serialized(() => this.tx.claimTask(taskId, memberId, leaseMs)); }
   updateTaskStatus(taskId: string, status: SwarmTask["status"]): Promise<boolean> { return this.serialized(() => this.tx.updateTaskStatus(taskId, status)); }
   releaseTask(taskId: string, opts?: { countAsRetry?: boolean }): Promise<boolean> { return this.serialized(() => this.tx.releaseTask(taskId, opts)); }
@@ -2024,6 +2025,13 @@ class Tx implements SwarmStoreTx {
     this.db.run(
       `UPDATE swarm_member SET human_chat_at = ?, updated_at = ? WHERE id = ?`,
       [humanChatAt, Date.now(), memberId],
+    );
+  }
+
+  async updateMemberModel(memberId: string, model: { providerID: string; modelID: string } | undefined): Promise<void> {
+    this.db.run(
+      `UPDATE swarm_member SET provider_id = ?, model_id = ?, updated_at = ? WHERE id = ?`,
+      [model?.providerID ?? null, model?.modelID ?? null, Date.now(), memberId],
     );
   }
 

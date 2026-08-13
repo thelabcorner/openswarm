@@ -115,6 +115,15 @@ export interface SwarmStoreTx {
    * (the human-chat state machine's persisted timestamp). */
   updateMemberHumanChat(memberId: string, humanChatAt: number | null): Promise<void>;
 
+  /** Set a member's model (providerID/modelID) or clear it (undefined — the
+   * member falls back to the spawn priority chain). Used by `swarm_model` set
+   * and by the session.updated auto-sync when the user changes a member's
+   * model in the chat composer. */
+  updateMemberModel(
+    memberId: string,
+    model: { providerID: string; modelID: string } | undefined,
+  ): Promise<void>;
+
   /**
    * Atomically claim a ready task for a member. Returns true only if the
    * claim succeeded; SQLite affects-row is the source of truth.
