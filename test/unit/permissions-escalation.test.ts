@@ -135,8 +135,9 @@ async function runtime() {
 
 /** Create a swarm + spawn a worker member; returns ids + the runtime.
  * The runtime singleton is lazily initialized by the FIRST tool call, so the
- * runtime handle is fetched AFTER swarm_create executes. Each swarm needs its
- * own coordinator session (one session runs one swarm). */
+ * runtime handle is fetched AFTER swarm_create executes. Each test uses its
+ * own coordinator session to keep swarms isolated (multi-own also permits
+ * reusing one session across swarms, but isolation is simpler to assert). */
 async function makeSwarmWithWorker(name: string, workerName = "worker") {
   const coordSession = `ses-esc-lead-${Math.random().toString(36).slice(2, 8)}`;
   const createRes = await tool.swarm_create.execute({ name }, ctx(coordSession));

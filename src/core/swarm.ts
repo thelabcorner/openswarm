@@ -157,18 +157,19 @@ export class SwarmCore {
     const now = Date.now();
 
     return this.store.transaction(async (tx) => {
-      // The calling session can be a member of only ONE swarm (swarm_member
-      // session_id is UNIQUE). If it already owns a swarm with a DIFFERENT
-      // name, creating another would violate that — surface a clear, actionable
-      // message instead of a raw UNIQUE constraint error. Same-name heals.
-      const existing = await tx.getSwarmBySession(input.coordinatorSessionId);
+      // Multi-own (migration v12): a session may be the COORDINATOR member of N
+      // swarms — the swarm_member.session_id UNIQUE is gone. Name-based
+      // idempotence replaces the old one-session-one-swarm guard:
+      //   1. If the session already OWNS a swarm with this name → reuse it
+      //      (same-name heal, keeps the existing return path shape).
+      //   2. Else if a PROJECT swarm with this name exists (created by another
+      //      session) → rebind its coordinator to the calling session.
+      //   3. Else → create a new swarm + coordinator member (multi-own).
+      const owned = (await tx.listSwarmsBySession(input.coordinatorSessionId))
+        .filter((s) => s.coordinatorSessionId === input.coordinatorSessionId);
+      const existing = owned.find((s) => s.name === input.name);
       if (existing) {
-        if (existing.name === input.name) {
-          return { swarm: existing, coordinator: (await tx.listMembers(existing.id)).find((m) => m.role === "coordinator")!, tasks: await tx.listTasks(existing.id) };
-        }
-        throw new Error(
-          `this session already belongs to swarm "${existing.name}" — one session runs one swarm. Reuse it (pass swarmId "${existing.id}") or delete it first (swarm_delete).`,
-        );
+        return { swarm: existing, coordinator: (await tx.listMembers(existing.id)).find((m) => m.role === "coordinator")!, tasks: await tx.listTasks(existing.id) };
       }
       // Idempotent: if a swarm with this name already exists in the project,
       // return it instead of a raw UNIQUE constraint error. Models often retry
@@ -629,8 +630,14 @@ export class SwarmCore {
         ? await this.store.getMemberById(input.fromMemberId)
         : await this.getMember(input.swarmId, input.fromMemberId);
     } else if (input.fromSessionId) {
-      const bySession = await this.store.getMemberBySessionId(input.fromSessionId);
-      if (bySession && (input.force || bySession.swarmId === input.swarmId)) sender = bySession;
+      // Multi-own (migration v12): a session may be a member of N swarms — the
+      // sender must resolve WITHIN the target swarm (swarm-scoped), or globally
+      // when force permits any registered member. Without this, swarm B's send
+      // would pick up swarm A's coordinator row.
+      const bySession = input.force
+        ? await this.store.getMemberBySessionId(input.fromSessionId)
+        : await this.store.getMemberBySessionAndSwarm(input.fromSessionId, input.swarmId);
+      if (bySession) sender = bySession;
     }
     // Agent UX (cross-swarm): the most common cause is messaging a DIFFERENT
     // swarm without force — the error names the exact remedy instead of
@@ -1107,8 +1114,12 @@ export class SwarmCore {
         ? await this.store.getMemberById(input.fromMemberId)
         : await this.getMember(input.swarmId, input.fromMemberId);
     } else if (input.fromSessionId) {
-      const bySession = await this.store.getMemberBySessionId(input.fromSessionId);
-      if (bySession && (input.force || bySession.swarmId === swarm.id)) sender = bySession;
+      // Multi-own (migration v12): swarm-scoped sender resolution (see
+      // sendMessage — a session may be a member of N swarms).
+      const bySession = input.force
+        ? await this.store.getMemberBySessionId(input.fromSessionId)
+        : await this.store.getMemberBySessionAndSwarm(input.fromSessionId, swarm.id);
+      if (bySession) sender = bySession;
     }
     if (!sender) {
       throw new Error(

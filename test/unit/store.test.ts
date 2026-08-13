@@ -677,12 +677,13 @@ describe("SQLiteStore", () => {
 
       const reopened = new SQLiteStore(join(dir3, "old.db"));
       await reopened.ready();
-      // user_version reached the latest migration (11: deliverables+contracts;
+      // user_version reached the latest migration (12: swarm_member.session_id
+      // UNIQUE dropped — multi-own; 11: deliverables+contracts;
       // 10: pending permissions; 9: task reserved_for; 8 = message.noreply;
       // 7 = resonant_at, Hive H2; 6 = beliefs, 5 = annotations, 4 = lease
       // columns, 3 = expires_at).
       const uv = await (reopened as any).db.query(`PRAGMA user_version`).get();
-      expect((uv as { user_version: number } | undefined)?.user_version).toBe(11);
+      expect((uv as { user_version: number } | undefined)?.user_version).toBe(12);
       // Columns present + usable.
       await reopened.insertSwarm(newSwarm("uv"));
       const swarm = await reopened.getSwarm("swarm-uv");
@@ -699,6 +700,14 @@ describe("SQLiteStore", () => {
       // Belief table exists and is usable on the migrated DB.
       await reopened.insertBelief({ id: "uv-bel", swarmId: "swarm-uv", factHash: "h1", text: "fact", confidence: 0.5, tier: "whisper", authorMemberId: a, createdAt: now, updatedAt: now });
       expect((await reopened.listBeliefs("swarm-uv")).length).toBe(1);
+      // v12 (multi-own): the migrated DB accepts a SECOND member with the same
+      // session (session_id UNIQUE is gone) — the whole point of the rebuild.
+      await reopened.insertMember({ id: "mem-uv-c2", swarmId: "swarm-uv", name: "coordinator2", role: "coordinator", sessionId: "ses-uv-a", status: "idle", workspaceMode: "shared-read", createdAt: now, updatedAt: now });
+      const sameSession = await reopened.listMembersBySessionId("ses-uv-a");
+      expect(sameSession.length).toBe(2);
+      // The swarm-scoped lookup resolves within the (session, swarm) pair —
+      // both rows share the session, and the second insert is reachable.
+      expect((await reopened.getMemberByName("swarm-uv", "coordinator2"))?.sessionId).toBe("ses-uv-a");
       await reopened.close();
     } finally {
       try { rmSync(dir3, { recursive: true, force: true }); } catch { /* ignore */ }

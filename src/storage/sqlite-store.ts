@@ -98,7 +98,10 @@ CREATE TABLE IF NOT EXISTS swarm_member (
   swarm_id TEXT NOT NULL,
   name TEXT NOT NULL,
   role TEXT NOT NULL,
-  session_id TEXT NOT NULL UNIQUE,
+  -- Multi-own (migration v12): a session may be the coordinator member of N
+  -- swarms, so session_id is NOT unique. Workers stay 1:1 (they never spawn
+  -- swarms); uniqueness per swarm is UNIQUE(swarm_id, name) below.
+  session_id TEXT NOT NULL,
   agent TEXT,
   provider_id TEXT,
   model_id TEXT,
@@ -627,6 +630,16 @@ export class SQLiteStore implements SwarmStore {
    * so steps may be re-run defensively without corrupting state.
    */
   private migrate(): void {
+    // Migration v12 (multi-own): rebuild swarm_member WITHOUT the UNIQUE on
+    // session_id so one session may be the coordinator member of N swarms.
+    // This MUST run OUTSIDE the transaction below: `PRAGMA foreign_keys` is a
+    // no-op inside a transaction (SQLite), and swarm_member has NO ACTION FK
+    // children (blackboard/annotation/belief author_member_id) whose rows
+    // would block the DROP while FK enforcement is live. `runV12Rebuild`
+    // toggles the pragma outside the txn, wraps the rebuild in an explicit
+    // BEGIN/COMMIT, and advances user_version to 12 so the chain below skips
+    // the (no-op) v12 step on legacy DBs.
+    this.runV12Rebuild();
     this.db.transaction(() => {
       // Step 0: current full schema (CREATE TABLE IF NOT EXISTS — a no-op on
       // existing tables, but creates any table added after the initial release,
@@ -645,6 +658,70 @@ export class SQLiteStore implements SwarmStore {
       // Wave 5 (Hive H2): resonant_at — mirrored in MIGRATIONS v7.
       this.addMissingColumn("swarm_belief", "resonant_at", "INTEGER");
     });
+  }
+
+  /**
+   * Migration v12 (multi-own): rebuild swarm_member without the UNIQUE on
+   * session_id. SQLite cannot drop a column constraint, so the table is
+   * rebuilt: create swarm_member_v2 (same DDL minus the UNIQUE, plus the
+   * original indexes), copy every row, drop the old table, rename, recreate
+   * the index. Idempotent: skipped when the UNIQUE is already gone (fresh DBs
+   * created by SCHEMA post-v12, or DBs already migrated).
+   *
+   * Runs OUTSIDE the transactional migrate() body: PRAGMA foreign_keys is a
+   * no-op inside a transaction, and the DROP would violate the NO ACTION FK
+   * children (swarm_blackboard/swarm_artifact_annotation/swarm_belief
+   * author_member_id) while enforcement is live. With foreign_keys OFF the
+   * DROP leaves child rows untouched (their member ids are preserved by the
+   * row copy, so nothing dangles). The rebuild itself is wrapped in an
+   * explicit BEGIN/COMMIT so a mid-sequence failure cannot leave a
+   * half-rebuilt table.
+   */
+  private runV12Rebuild(): void {
+    if (this.getUserVersion() >= 12) return;
+    const tbl = this.db.query<{ sql: string }, []>(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'swarm_member'`,
+    ).get();
+    if (!tbl?.sql?.includes("session_id TEXT NOT NULL UNIQUE")) return; // fresh or already migrated
+    this.db.exec("PRAGMA foreign_keys = OFF;");
+    try {
+      this.db.exec("BEGIN;");
+      this.db.exec(`
+        CREATE TABLE swarm_member_v2 (
+          id TEXT PRIMARY KEY,
+          swarm_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          agent TEXT,
+          provider_id TEXT,
+          model_id TEXT,
+          status TEXT NOT NULL,
+          workspace_mode TEXT NOT NULL,
+          workspace_path TEXT,
+          branch TEXT,
+          current_task_id TEXT,
+          human_chat_at INTEGER,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          last_active_at INTEGER,
+          FOREIGN KEY(swarm_id) REFERENCES swarm(id) ON DELETE CASCADE,
+          UNIQUE(swarm_id, name)
+        );
+        INSERT INTO swarm_member_v2 (id, swarm_id, name, role, session_id, agent, provider_id, model_id, status, workspace_mode, workspace_path, branch, current_task_id, human_chat_at, created_at, updated_at, last_active_at)
+          SELECT id, swarm_id, name, role, session_id, agent, provider_id, model_id, status, workspace_mode, workspace_path, branch, current_task_id, human_chat_at, created_at, updated_at, last_active_at FROM swarm_member;
+        DROP TABLE swarm_member;
+        ALTER TABLE swarm_member_v2 RENAME TO swarm_member;
+        CREATE INDEX IF NOT EXISTS idx_member_status ON swarm_member(swarm_id, status);
+      `);
+      this.db.exec("COMMIT;");
+      this.db.exec(`PRAGMA user_version = 12`);
+    } catch (err) {
+      try { this.db.exec("ROLLBACK;"); } catch { /* already aborted */ }
+      throw err;
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON;");
+    }
   }
 
   /**
@@ -824,6 +901,21 @@ export class SQLiteStore implements SwarmStore {
         `);
       },
     },
+    {
+      version: 12,
+      label: "drop swarm_member.session_id UNIQUE (multi-swarm ownership per session)",
+      up: () => {
+        // The actual rebuild runs OUTSIDE the migration transaction in
+        // runV12Rebuild(): PRAGMA foreign_keys is a no-op inside a transaction,
+        // and the DROP of the old swarm_member would violate the NO ACTION FK
+        // children (blackboard/annotation/belief author_member_id) while
+        // enforcement is live. runV12Rebuild advances user_version to 12 for
+        // legacy DBs, so this chain step is skipped for them. For FRESH DBs the
+        // table is already created without the UNIQUE by SCHEMA, so nothing to
+        // do here either — the step exists to keep the chain's version numbering
+        // truthful (the migration boundary IS v12).
+      },
+    },
   ];
 
   private runMigrations(): void {
@@ -914,6 +1006,9 @@ export class SQLiteStore implements SwarmStore {
   listMembers(swarmId: string): Promise<SwarmMember[]> { return this.serialized(() => this.tx.listMembers(swarmId)); }
   getMemberById(memberId: string): Promise<SwarmMember | undefined> { return this.serialized(() => this.tx.getMemberById(memberId)); }
   getMemberBySessionId(sessionID: string): Promise<SwarmMember | undefined> { return this.serialized(() => this.tx.getMemberBySessionId(sessionID)); }
+  listMembersBySessionId(sessionID: string): Promise<SwarmMember[]> { return this.serialized(() => this.tx.listMembersBySessionId(sessionID)); }
+  getMemberBySessionAndSwarm(sessionID: string, swarmId: string): Promise<SwarmMember | undefined> { return this.serialized(() => this.tx.getMemberBySessionAndSwarm(sessionID, swarmId)); }
+  listSwarmsBySession(sessionID: string): Promise<Swarm[]> { return this.serialized(() => this.tx.listSwarmsBySession(sessionID)); }
   getMemberByName(swarmId: string, name: string): Promise<SwarmMember | undefined> { return this.serialized(() => this.tx.getMemberByName(swarmId, name)); }
   listTasks(swarmId: string): Promise<SwarmTask[]> { return this.serialized(() => this.tx.listTasks(swarmId)); }
   listTaskDependencies(swarmId: string): Promise<TaskDependency[]> { return this.serialized(() => this.tx.listTaskDependencies(swarmId)); }
@@ -1178,6 +1273,23 @@ class Tx implements SwarmStoreTx {
     return this.getSwarm(r.swarm_id);
   }
 
+  async listSwarmsBySession(sessionID: string): Promise<Swarm[]> {
+    // Multi-own (migration v12): every swarm this session is a member of
+    // (DISTINCT by swarm_id — a session holds at most one row per swarm via
+    // UNIQUE(swarm_id, name), but the join is defensive). The swarms the
+    // session OWNS/coordinates are those whose coordinator_session_id is the
+    // session (callers filter when ownership semantics matter).
+    const rows = this.db.query<{ swarm_id: string }, [string]>(
+      `SELECT DISTINCT swarm_id FROM swarm_member WHERE session_id = ? ORDER BY created_at`,
+    ).all(sessionID);
+    const swarms: Swarm[] = [];
+    for (const r of rows) {
+      const s = await this.getSwarm(r.swarm_id);
+      if (s) swarms.push(s);
+    }
+    return swarms;
+  }
+
   async getSwarmByName(projectId: string, name: string): Promise<Swarm | undefined> {
     const r = this.db.query<RowSwarm, [string, string]>(
       `SELECT * FROM swarm WHERE project_id = ? AND name = ?`,
@@ -1200,9 +1312,32 @@ class Tx implements SwarmStoreTx {
   }
 
   async getMemberBySessionId(sessionID: string): Promise<SwarmMember | undefined> {
+    // FIRST-MATCH (backward compat): with multi-own a session may have N
+    // member rows; this returns the first by insertion order. Callers that
+    // resolve a member within a specific swarm MUST use
+    // getMemberBySessionAndSwarm instead.
     const r = this.db.query<RowMember, [string]>(
       `SELECT * FROM swarm_member WHERE session_id = ? LIMIT 1`,
     ).get(sessionID);
+    return r ? toMember(r) : undefined;
+  }
+
+  async listMembersBySessionId(sessionID: string): Promise<SwarmMember[]> {
+    // Multi-own (migration v12): ALL member rows with this session across
+    // every swarm, created_at order.
+    const rows = this.db.query<RowMember, [string]>(
+      `SELECT * FROM swarm_member WHERE session_id = ? ORDER BY created_at`,
+    ).all(sessionID);
+    return rows.map(toMember);
+  }
+
+  async getMemberBySessionAndSwarm(sessionID: string, swarmId: string): Promise<SwarmMember | undefined> {
+    // Exact (session, swarm) match — the swarm-scoped coordinator lookup.
+    // Multi-own: resolving 'the coordinator member of swarm X' by session MUST
+    // go through this so swarm B's operations never pick up swarm A's row.
+    const r = this.db.query<RowMember, [string, string]>(
+      `SELECT * FROM swarm_member WHERE session_id = ? AND swarm_id = ? LIMIT 1`,
+    ).get(sessionID, swarmId);
     return r ? toMember(r) : undefined;
   }
 

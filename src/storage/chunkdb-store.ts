@@ -258,6 +258,8 @@ export class ChunkDbStore implements SwarmStore {
   }
 
   async getSwarmBySession(sessionID: string): Promise<Swarm | undefined> {
+    // FIRST-MATCH (backward compat): the first swarm the session belongs to.
+    // With multi-own (migration v12) use listSwarmsBySession for all of them.
     return this.serialized(async () => {
       const member = this.scanAll<SwarmMember>(NS.member).find((m) => m.sessionId === sessionID);
       if (!member) return undefined;
@@ -325,11 +327,9 @@ export class ChunkDbStore implements SwarmStore {
 
   async insertMember(m: NewSwarmMember): Promise<SwarmMember> {
     return this.serialized(async () => {
-      // session_id is globally unique; (swarm_id, name) is unique per swarm.
-      const bySession = this.scanAll<SwarmMember>(NS.member).find((x) => x.sessionId === m.sessionId);
-      if (bySession && bySession.id !== m.id) {
-        throw new Error(`UNIQUE constraint failed: swarm_member.session_id`);
-      }
+      // Multi-own (migration v12): session_id is NO LONGER globally unique — a
+      // session may be the coordinator member of N swarms. Only (swarm_id,
+      // name) stays unique per swarm.
       const byName = this.scan<SwarmMember>(NS.member, m.swarmId).find((x) => x.name === m.name);
       if (byName && byName.id !== m.id) {
         throw new Error(`UNIQUE constraint failed: swarm_member (swarm_id, name)`);
@@ -350,9 +350,47 @@ export class ChunkDbStore implements SwarmStore {
   }
 
   async getMemberBySessionId(sessionID: string): Promise<SwarmMember | undefined> {
+    // FIRST-MATCH (backward compat): with multi-own a session may have N
+    // member rows; this returns the first. Callers resolving a member within a
+    // specific swarm MUST use getMemberBySessionAndSwarm instead.
     return this.serialized(async () =>
       this.scanAll<SwarmMember>(NS.member).find((m) => m.sessionId === sessionID),
     );
+  }
+
+  async listMembersBySessionId(sessionID: string): Promise<SwarmMember[]> {
+    // Multi-own (migration v12): ALL member rows with this session across every
+    // swarm, created_at order.
+    return this.serialized(async () =>
+      this.scanAll<SwarmMember>(NS.member)
+        .filter((m) => m.sessionId === sessionID)
+        .sort((a, b) => a.createdAt - b.createdAt),
+    );
+  }
+
+  async getMemberBySessionAndSwarm(sessionID: string, swarmId: string): Promise<SwarmMember | undefined> {
+    // Exact (session, swarm) match — the swarm-scoped coordinator lookup.
+    return this.serialized(async () =>
+      this.scan<SwarmMember>(NS.member, swarmId).find((m) => m.sessionId === sessionID),
+    );
+  }
+
+  async listSwarmsBySession(sessionID: string): Promise<Swarm[]> {
+    return this.serialized(async () => {
+      // Multi-own (migration v12): every swarm this session is a member of
+      // (distinct by swarm id). The swarms the session OWNS/coordinates are
+      // those whose coordinatorSessionId is the session.
+      const ids = new Set<string>();
+      for (const m of this.scanAll<SwarmMember>(NS.member)) {
+        if (m.sessionId === sessionID) ids.add(m.swarmId);
+      }
+      const swarms: Swarm[] = [];
+      for (const id of ids) {
+        const s = this.db.get<Swarm>(NS.swarm, id);
+        if (s) swarms.push(s);
+      }
+      return swarms;
+    });
   }
 
   async getMemberByName(swarmId: string, name: string): Promise<SwarmMember | undefined> {

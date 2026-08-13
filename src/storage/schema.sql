@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS swarm_member (
   swarm_id TEXT NOT NULL,
   name TEXT NOT NULL,
   role TEXT NOT NULL,
-  session_id TEXT NOT NULL UNIQUE,
+  -- Multi-own (migration v12): a session may be the coordinator member of N
+  -- swarms, so session_id is NOT unique. Workers stay 1:1 (they never spawn
+  -- swarms); uniqueness per swarm is UNIQUE(swarm_id, name) below.
+  session_id TEXT NOT NULL,
   agent TEXT,
   provider_id TEXT,
   model_id TEXT,

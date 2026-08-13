@@ -37,6 +37,9 @@ class StubStore {
   async getMemberBySessionId(sessionID: string): Promise<SwarmMember | undefined> {
     return this.bySession.get(sessionID);
   }
+  async listMembersBySessionId(sessionID: string): Promise<SwarmMember[]> {
+    return [...this.members.values()].filter((m) => m.sessionId === sessionID);
+  }
   async updateMemberHumanChat(memberId: string, humanChatAt: number | null): Promise<void> {
     this.chatLog.push({ id: memberId, at: humanChatAt });
     const m = this.members.get(memberId);

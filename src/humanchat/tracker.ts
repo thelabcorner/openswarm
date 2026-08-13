@@ -22,7 +22,7 @@ import type { SwarmStore } from "../storage/store.js";
  * and to a clock, and is fully unit-testable with a fake clock and stub store.
  */
 export interface ChatTrackerDeps {
-  store: Pick<SwarmStore, "getMemberBySessionId" | "updateMemberHumanChat">;
+  store: Pick<SwarmStore, "listMembersBySessionId" | "getMemberBySessionId" | "updateMemberHumanChat">;
   /** Injectable clock; defaults to Date.now. */
   now?: () => number;
 }
@@ -96,11 +96,21 @@ export class HumanChatTracker {
    */
   async onUserMessage(sessionID: string, isSelf: boolean): Promise<boolean> {
     if (isSelf) return false;
-    const member = await this.deps.store.getMemberBySessionId(sessionID);
-    if (!member || member.role === "coordinator") return false;
+    // Multi-own (migration v12): the pause applies to EVERY member row of the
+    // session so it covers every swarm the session belongs to — but never
+    // coordinator rows (the user's primary chat is exempt from swarm machinery,
+    // exactly as before). Worker rows are 1:1 in practice, so the common case
+    // sets exactly one row.
+    const members = await this.deps.store.listMembersBySessionId(sessionID);
+    if (members.length === 0) return false;
     const now = this.deps.now?.() ?? Date.now();
-    await this.deps.store.updateMemberHumanChat(member.id, now);
-    return true;
+    let changed = false;
+    for (const m of members) {
+      if (m.role === "coordinator") continue;
+      await this.deps.store.updateMemberHumanChat(m.id, now);
+      changed = true;
+    }
+    return changed;
   }
 
   /** Is this member currently in a human chat (within the lull window)? */
@@ -118,11 +128,13 @@ export class HumanChatTracker {
     return this.chatting(member, swarm);
   }
 
-  /** Clear chat state (error/deleted/forced release). */
+  /** Clear chat state (error/deleted/forced release). Multi-own (migration
+   * v12): clears EVERY member row with the session. */
   async clear(sessionID: string): Promise<void> {
-    const member = await this.deps.store.getMemberBySessionId(sessionID);
-    if (!member) return;
-    await this.deps.store.updateMemberHumanChat(member.id, null);
+    const members = await this.deps.store.listMembersBySessionId(sessionID);
+    for (const m of members) {
+      await this.deps.store.updateMemberHumanChat(m.id, null);
+    }
   }
 
   /** Restore chat state at startup: clear `humanChatAt` if it lapsed while the

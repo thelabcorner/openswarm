@@ -219,7 +219,8 @@ describe("emergency kill switch — manual trip/clear (the feature)", () => {
   test("nuke requires confirm 'NUKE ALL'; deletes all swarms", async () => {
     await initPlugin();
     const a = await createSwarm("em-nuke-a");
-    // A second swarm needs its OWN coordinator session (one session = one swarm).
+    // A second swarm (multi-own allows it to reuse a session, but a distinct
+    // session keeps this test isolated).
     const createdB = await tool.swarm_create.execute({ name: "em-nuke-b" }, ctx("ses-nuke-b"));
     const b = JSON.parse(String(createdB.output ?? createdB)).swarm.id;
     await spawn(a, "worker");

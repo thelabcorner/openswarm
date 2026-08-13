@@ -269,7 +269,10 @@ export class ReviveEngine {
     const { store, core } = this.host;
     const swarm = await store.getSwarm(swarmId);
     if (!swarm) throw new Error(`no swarm '${swarmId}'`);
-    const coordinator = await store.getMemberBySessionId(swarm.coordinatorSessionId);
+    // Multi-own (migration v12): resolve THE coordinator of THIS swarm via the
+    // (session, swarm) pair — first-match would pick another swarm's
+    // coordinator row when the session co-owns N swarms.
+    const coordinator = await store.getMemberBySessionAndSwarm(swarm.coordinatorSessionId, swarmId);
     if (!coordinator) throw new Error(`swarm '${swarm.name}' has no coordinator member`);
 
     let cancelledTasks = 0;

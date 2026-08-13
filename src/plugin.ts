@@ -188,6 +188,12 @@ async function resolveMentions(
   return { mentionedResolved, mentionedUnresolved, tasksResolved, tasksUnresolved, filesResolved, filesUnresolved };
 }
 
+/** Permission types whose silent auto-allow under allowAllMemberPermissions is
+ * worth surfacing to the coordinator (t-perm-trace): execution / state
+ * mutation ops that can escape the swarm worktree boundary. Purely-read ops
+ * (read/list/glob/grep) and non-path ops are low-risk and stay silent. */
+const ALLOW_ALL_HIGH_RISK_TYPES = new Set(["bash", "edit", "write", "external_directory"]);
+
 /**
  * Auto-allow permission requests from swarm members when the operation stays
  * within the member's swarm worktree. The coordinator spawned the member to
@@ -204,12 +210,6 @@ async function autoAllowSwarmPermission(
   if (!member) return; // not a swarm member — leave default behavior
   if (member.role === "coordinator") return; // coordinator prompts still go to the user
 
-  // "Accept-all" mode: members were spawned to do a job; never prompt them.
-  if (rt.allowAllMemberPermissions) {
-    output.status = "allow";
-    return;
-  }
-
   const swarm = await rt.store.getSwarm(member.swarmId);
   if (!swarm) return;
 
@@ -221,11 +221,41 @@ async function autoAllowSwarmPermission(
   const inherited = await rt.inheritCoordinatorPermission(swarm, input.type, input.pattern);
   if (inherited !== undefined) {
     output.status = inherited;
-    return;
+  } else {
+    // FALLBACK (runtime could not resolve permissions): heuristic scoping —
+    // worktree + OS temp scratch space for building/testing members.
+    applyWorktreeScoping(rt, swarm, member, input, output);
   }
 
-  // FALLBACK (runtime could not resolve permissions): heuristic scoping —
-  // worktree + OS temp scratch space for building/testing members.
+  // "Accept-all" mode (t-perm-trace): members were spawned to do a job; never
+  // prompt them — force 'allow' regardless of the verdict above. BUT a
+  // HIGH-RISK request the normal policy would have gated (bash/edit/write/
+  // external_directory outside the trusted worktree scope, or an inherited
+  // coordinator DENY) must not be SILENTLY auto-allowed: surface a deduped
+  // advisory finding to the coordinator so allow-all doesn't blind the swarm
+  // to risky member asks. Non-blocking — the member is NOT stuck, there is no
+  // pending record to answer.
+  if (rt.allowAllMemberPermissions) {
+    const gated = output.status === "ask" || output.status === "deny";
+    output.status = "allow";
+    if (gated && input.id && ALLOW_ALL_HIGH_RISK_TYPES.has(input.type)) {
+      await rt.notifyAllowAllHighRisk(swarm, member, input).catch((err) => {
+        console.error(`[swarm] allow-all high-risk notice to coordinator failed:`, err);
+      });
+    }
+  }
+}
+
+/** Worktree-boundary scoping fallback (used when the coordinator's permission
+ * policy cannot be inherited): a path op inside the worktree or OS temp dir is
+ * allowed; everything else is left "ask" so the user retains control. */
+function applyWorktreeScoping(
+  rt: SwarmPluginRuntime,
+  swarm: Swarm,
+  member: SwarmMember,
+  input: { id: string; type: string; pattern?: string | Array<string>; sessionID: string; title?: string },
+  output: { status: "ask" | "deny" | "allow" },
+): void {
   const worktree = swarm.directory ? swarm.directory.replace(/[\\/]+$/, "") : "";
   const patterns = Array.isArray(input.pattern) ? input.pattern : [input.pattern].filter((p): p is string => !!p);
 
@@ -273,7 +303,9 @@ async function autoAllowSwarmPermission(
   // P-D3: an empty (legacy) worktree no longer blankets bash — a member with
   // no worktree root must not get implicit command-execution authority. Emit
   // a one-time console warning so the legacy-allow behavior change is visible.
-  if (wt === "" && isBash) {
+  // (Under allow-all the ask IS auto-allowed, so the "NOT auto-allowed" text
+  // would be wrong — skip the warning there; t-perm-trace.)
+  if (wt === "" && isBash && !rt.allowAllMemberPermissions) {
     console.warn(
       `[swarm] permission.ask: bash request from member ${member.name} on a swarm with an EMPTY worktree — NOT auto-allowed (P-D3); the member must be granted explicit bash scope.`,
     );
@@ -416,6 +448,10 @@ export class SwarmPluginRuntime implements StallHost {
    * escalation): ONE notification per pending prompt, never more — a re-raise
    * of the same prompt (same ask id) must not spam the coordinator. */
   private notifiedPermissionIds = new Set<string>();
+  /** t-perm-trace: permission ids already surfaced as allow-all high-risk
+   * advisories — ONE advisory per ask id, never more (a re-raise of the same
+   * ask must not re-notify). */
+  private allowAllAdvisedIds = new Set<string>();
   /** The default member model (config `defaultMemberModel`). */
   readonly defaultMemberModel: { providerID: string; modelID: string };
 
@@ -484,9 +520,30 @@ export class SwarmPluginRuntime implements StallHost {
         }),
     });
     // Auto-wake: delivering a message to an idle member wakes it immediately.
-    this.core.setWakeDeliverer((memberId, memberSessionId) =>
-      this.broker.deliverToIdleMember(memberId, memberSessionId),
-    );
+    this.core.setWakeDeliverer(async (memberId, memberSessionId) => {
+      try {
+        return await this.broker.deliverToIdleMember(memberId, memberSessionId);
+      } catch (err) {
+        // Delivery-error surfacing (t-perm-delivery): a failed mailbox delivery
+        // used to die in a console.error into the plugin log — the coordinator
+        // never saw it. Surface it to the COORDINATOR's session (debounced +
+        // batched by notifyCoordinator, exactly like completion notices) so the
+        // operator actually learns their swarm has a delivery problem. The
+        // broker still reverts the message to `queued` with the error recorded
+        // (retry budget applies); this is purely an operator-visible notice.
+        const member = await this.store.getMemberById(memberId).catch(() => undefined);
+        if (member) {
+          const swarm = await this.store.getSwarm(member.swarmId).catch(() => undefined);
+          if (swarm) {
+            this.notifyCoordinator(
+              { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
+              `mailbox delivery to member '${member.name}' FAILED — the message stays queued and will retry; check the member's session. (${(err as Error)?.message ?? String(err)})`,
+            );
+          }
+        }
+        throw err;
+      }
+    });
     this.startSweep();
   }
 
@@ -1533,6 +1590,44 @@ export class SwarmPluginRuntime implements StallHost {
     });
   }
 
+  /**
+   * t-perm-trace remediation: under allowAllMemberPermissions, a HIGH-RISK
+   * member request (one the normal worktree scoping / inherited policy would
+   * have gated to "ask"/"deny") is auto-allowed SILENTLY — nothing is
+   * recorded and the coordinator never learns the member reached outside the
+   * trusted scope. Surface a deduped, NON-BLOCKING advisory finding so
+   * allow-all doesn't blind the swarm. No pending record is created — the
+   * member is NOT blocked, so there is nothing to answer (the reply recipe is
+   * intentionally absent).
+   */
+  async notifyAllowAllHighRisk(
+    swarm: Swarm,
+    member: SwarmMember,
+    input: { id?: string; type: string; pattern?: string | Array<string>; title?: string },
+  ): Promise<void> {
+    if (!input.id || this.allowAllAdvisedIds.has(input.id)) return;
+    this.allowAllAdvisedIds.add(input.id);
+    const coordMember = await this.store.getMemberById(swarm.coordinatorMemberId);
+    const patternText = Array.isArray(input.pattern) ? input.pattern.join(", ") : input.pattern ?? input.title ?? "";
+    const lines = [
+      `[PERMISSION ALLOWED] member '${member.name}' requested ${input.type}: ${patternText ? fence(patternText) : "(no pattern)"} — auto-allowed by allowAllMemberPermissions (outside the member's trusted worktree scope).`,
+      `Allow-all auto-allows member asks that reach the plugin's permission hook. Caveat: asks that bypass the hook or come from an unresolvable member session (e.g. a re-rooted session) are NOT suppressed and stay invisible to escalation. To review member asks instead, remove 'allowAllMemberPermissions' from the plugin config — they will then escalate here as answerable permission-wall findings.`,
+    ];
+    await this.core.sendMessage({
+      swarmId: swarm.id,
+      fromMemberId: member.id,
+      to: coordMember?.name ?? "coordinator",
+      kind: "finding",
+      priority: "normal",
+      noreply: true,
+      message: lines.join("\n"),
+    }).catch((err) => {
+      // Advisory only — a delivery failure must not throw into the
+      // permission.ask path (the member is already unblocked).
+      console.error(`[swarm] allow-all high-risk notice to coordinator failed:`, err);
+    });
+  }
+
   /** Answer a member's pending permission prompt via the runtime adapter
    * (swarm_permissions reply path). Returns false when the prompt is already
    * gone (answered/expired) or the runtime cannot reach it. */
@@ -1941,7 +2036,10 @@ export class SwarmPluginRuntime implements StallHost {
     try {
       const swarm = await this.store.getSwarm(swarmId);
       if (!swarm) return;
-      const coord = await this.store.getMemberBySessionId(swarm.coordinatorSessionId);
+      // Multi-own (migration v12): resolve THE coordinator of THIS swarm via
+      // the (session, swarm) pair — first-match would pick another swarm's
+      // coordinator row when the session owns N swarms.
+      const coord = await this.store.getMemberBySessionAndSwarm(swarm.coordinatorSessionId, swarmId);
       if (!coord) return;
       const existing = await this.store.getBlackboard(swarmId, LAST_USED_MODEL_KEY);
       await this.core.blackboardPut({
@@ -2068,7 +2166,6 @@ export async function swarmPlugin(
         async execute(args, ctx) {
           const rt = await ensureRt();
           const core = rt.core;
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
 
           // Emergency kill switch (t-emergency): refuse member spawns while
           // tripped; enforce the hard member cap; count spawns toward the
@@ -2125,22 +2222,13 @@ export async function swarmPlugin(
 
           let swarmId = args.swarmId;
           if (!swarmId) {
-            // The calling session can belong to only ONE swarm. If it already
-            // owns a swarm with a DIFFERENT name, creating a new one here would
-            // violate that (raw UNIQUE error). Give the agent one clear line
-            // instead of a DB exception — this is the intuitive chain: one
-            // session, one swarm; reuse or delete before creating another.
-            const owned = await core.store.getSwarmBySession(ctx.sessionID);
-            if (owned && owned.name !== args.name) {
-              return {
-                output: `This session already owns swarm "${owned.name}" — one session can run one swarm. Reuse it (call swarm_delegate with name "${owned.name}", or pass swarmId "${owned.id}") or delete it first (swarm_delete).`,
-              };
-            }
-            // Create the swarm (or reuse the one this session already owns).
-            // createSwarm is idempotent for the calling session — it returns
-            // the existing swarm instead of erroring — so a coordinator that
-            // did swarm_create then swarm_delegate (without swarmId) still
-            // lands here with the right swarm.
+            // Multi-own (migration v12): a session may run N swarms. If it
+            // already owns one with this name, reuse it; otherwise CREATE a new
+            // one — the old 'already owns swarm' refusal is gone. createSwarm
+            // is idempotent for the calling session (same-name reuse, project
+            // same-name rebind, else create), so a coordinator that did
+            // swarm_create then swarm_delegate (without swarmId) still lands
+            // here with the right swarm.
             const created = await core.createSwarm({
               name: args.name,
               projectId: input.project?.id ?? "global",
@@ -2154,6 +2242,9 @@ export async function swarmPlugin(
             await seedTasks(swarmId, created.coordinator.id);
           } else {
             // Reusing an existing swarm — only its coordinator may set it up.
+            // Multi-own: resolve the caller WITHIN the target swarm so swarm B
+            // setup is not authorized by a swarm A coordinator row.
+            const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, swarmId);
             if (!caller) return { output: "calling session is not a swarm member" };
             if (caller.role !== "coordinator") {
               return { output: `only the coordinator may set up a swarm (you are '${caller.name}')` };
@@ -2315,8 +2406,9 @@ export async function swarmPlugin(
           "NOTE: if you intend to spawn members and start work, use swarm_delegate",
           "instead — it does everything swarm_create does PLUS spawns members and",
           "launches. swarm_create is only for setting up a shell you will grow",
-          "manually. One session runs one swarm: reusing a name returns the",
-          "existing swarm; a different name while you already own one is rejected.",
+          "manually. Multi-own: ONE session may own/run MULTIPLE swarms — reusing",
+          "a name returns the existing swarm; a different name creates another",
+          "swarm owned by the same session.",
         ].join("\n"),
         args: {
           name: tool.schema.string().describe("Swarm name (unique per project)."),
@@ -2390,8 +2482,10 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
-          // Verify caller is the coordinator (only coordinator delegates).
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          // Verify caller is the coordinator OF THIS SWARM (multi-own: the
+          // session may coordinate N swarms — swarm-scoped lookup, so swarm B
+          // delegation is not authorized by a swarm A coordinator row).
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
           if (!caller) return { output: "calling session is not a swarm member" };
           if (caller.role !== "coordinator") {
             return { output: `only the coordinator may delegate tasks (you are '${caller.name}')` };
@@ -2612,7 +2706,11 @@ export async function swarmPlugin(
           // Blocked-recipient detection: if any recipient is stuck behind a
           // pending permission prompt, notify their coordinator immediately
           // (permission-stall escalation) and surface it in the output.
-          const callerMember = await core.store.getMemberBySessionId(ctx.sessionID);
+          // Multi-own (migration v12): resolve the caller within the target
+          // swarm for the display name; fall back to any row (foreign senders
+          // via force are not members of args.swarmId).
+          const callerMember = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId)
+            ?? await core.store.getMemberBySessionId(ctx.sessionID);
           const blocked = await rt.detectBlockedRecipients(msgs, callerMember?.name ?? ctx.sessionID);
           // Emergency kill switch (t-emergency): count messages toward the
           // per-swarm per-minute tripwire (never refuses the current send).
@@ -2699,7 +2797,10 @@ export async function swarmPlugin(
           // Blocked-recipient detection: if the reply's recipient is stuck
           // behind a pending permission prompt, notify their coordinator
           // immediately (permission-stall escalation) and surface it.
-          const callerMember = await core.store.getMemberBySessionId(ctx.sessionID);
+          // Multi-own (migration v12): swarm-scoped with first-match fallback
+          // for the display name (see swarm_message).
+          const callerMember = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId)
+            ?? await core.store.getMemberBySessionId(ctx.sessionID);
           const blocked = await rt.detectBlockedRecipients(msgs, callerMember?.name ?? ctx.sessionID);
           // Emergency kill switch (t-emergency): count replies toward the
           // per-swarm per-minute message tripwire.
@@ -2748,7 +2849,9 @@ export async function swarmPlugin(
             const members = await core.store.listMembers(args.swarmId);
             const deps = await core.store.listTaskDependencies(args.swarmId);
             const nameById = new Map(members.map((m) => [m.id, m.name]));
-            const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+            // Multi-own (migration v12): the caller's row within THIS swarm
+            // (its currentTaskId/role are per-swarm).
+            const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
             // Hive H1: active annotations for corpse-pile counts (advisory).
             const annotations = await core.store.listAnnotations(args.swarmId, { activeOnly: true }).catch(() => []);
             const corpseByPath = corpseCountByPath(annotations);
@@ -2958,7 +3061,8 @@ export async function swarmPlugin(
             // new owner — invalidating stale-owner completion authority (complete
             // checks the CURRENT row owner, so the old owner can no longer
             // complete/publish after the rebind).
-            const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+            // Multi-own (migration v12): the coordinator of THIS swarm.
+            const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
             if (!caller) return { output: "calling session is not a swarm member" };
             if (caller.role !== "coordinator") {
               return { output: `only the coordinator may reassign tasks (you are '${caller.name}')` };
@@ -3770,8 +3874,9 @@ export async function swarmPlugin(
             return { output: `unsubscribed ${args.subscriptionId}` };
           }
           if (!args.pattern) return { output: "subscribe requires a pattern" };
-          const member = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!member || member.swarmId !== args.swarmId) {
+          // Multi-own (migration v12): membership within THIS swarm.
+          const member = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!member) {
             return { output: "calling session is not a member of this swarm" };
           }
           const sub = await core.subscribe({
@@ -4331,9 +4436,9 @@ export async function swarmPlugin(
           // Only the coordinator may stop a member (destructive-op safety; the
           // coordinator is the swarm's authority, per the prompt-injection
           // guardrail). A worker cannot stop its peers.
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller) return { output: "calling session is not a swarm member" };
-          if (caller.swarmId !== args.swarmId) return { output: "calling session is not a member of this swarm" };
+          // Multi-own (migration v12): the caller's row within THIS swarm.
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) return { output: "calling session is not a member of this swarm" };
           if (caller.role !== "coordinator" && caller.id !== target.id) {
             return { output: `only the coordinator may stop a member (you are '${caller.name}')` };
           }
@@ -4476,9 +4581,10 @@ export async function swarmPlugin(
           // Destructive-op safety: only the swarm's coordinator may delete it
           // (the prompt-injection guardrail — operational instructions come only
           // from the coordinator). A worker (or an unaffiliated session) cannot
-          // destroy the swarm.
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller || caller.swarmId !== args.swarmId) {
+          // destroy the swarm. Multi-own (migration v12): the coordinator of
+          // THIS swarm — a swarm A coordinator must not delete swarm B.
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) {
             return { output: "only the coordinator may delete the swarm (calling session is not a member of it)" };
           }
           if (caller.role !== "coordinator") {
@@ -4562,8 +4668,11 @@ export async function swarmPlugin(
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
           const swarm = await core.store.getSwarm(args.swarmId);
           if (!swarm) return { output: `no swarm '${args.swarmId}'` };
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller) return { output: "calling session is not a swarm member" };
+          // Multi-own (migration v12): the caller's row within THIS swarm.
+          // list is available to any member of the target swarm; define/delete
+          // are coordinator-of-this-swarm only (below).
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) return { output: "calling session is not a member of this swarm" };
 
           if (args.action === "list") {
             const contracts = await core.store.listContracts(args.swarmId);
@@ -4704,8 +4813,11 @@ export async function swarmPlugin(
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
           const swarm = await core.store.getSwarm(args.swarmId);
           if (!swarm) return { output: `no swarm '${args.swarmId}'` };
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller) return { output: "calling session is not a swarm member" };
+          // Multi-own (migration v12): the caller's row within THIS swarm — a
+          // session that is worker-in-A and coordinator-of-B must be DENIED
+          // revive on A but ALLOWED on B.
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) return { output: "calling session is not a member of this swarm" };
           const engine = new ReviveEngine(rt as never);
 
           if (args.action === "health") {
@@ -4874,12 +4986,16 @@ export async function swarmPlugin(
 
           // trip / clear are operator-gated: the caller must be a coordinator
           // of SOME swarm, or the runtime is headless (no member rows).
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
+          // Multi-own (migration v12): check EVERY member row of the session —
+          // first-match could return a worker row while another row is a
+          // coordinator.
+          const callerRows = await core.store.listMembersBySessionId(ctx.sessionID);
           const memberRows = await rt.countAllMembers();
-          const isCoordinator = !!caller && caller.role === "coordinator";
+          const caller = callerRows.find((m) => m.role === "coordinator");
+          const isCoordinator = caller !== undefined;
           const headless = memberRows === 0;
           if (!isCoordinator && !headless) {
-            return { output: `swarm_emergency trip/clear is operator-gated: you must be a coordinator of some swarm (you are '${caller?.name ?? "not a member"}')` };
+            return { output: `swarm_emergency trip/clear is operator-gated: you must be a coordinator of some swarm (you are '${callerRows[0]?.name ?? "not a member"}')` };
           }
           if (headless && !args.reason) {
             return { output: "headless runtime: trip requires reason (no coordinator session exists to review it)" };
@@ -4938,8 +5054,9 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller) return { output: "calling session is not a swarm member" };
+          // Multi-own (migration v12): the caller's row within THIS swarm.
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) return { output: "calling session is not a member of this swarm" };
 
           if (args.action === "list") {
             const pending = await core.store.listPendingPermissions(args.swarmId);
@@ -4965,12 +5082,11 @@ export async function swarmPlugin(
 
           // action === "reply" — coordinator of THIS swarm only (the authority
           // for the member's work; a worker or a foreign coordinator gets a
-          // clear rejection, mirroring the destructive-op safety pattern).
+          // clear rejection, mirroring the destructive-op safety pattern). The
+          // swarm-scoped lookup above already guarantees caller is in this
+          // swarm, so only the role gate remains.
           if (caller.role !== "coordinator") {
             return { output: `swarm_permissions reply is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
-          }
-          if (caller.swarmId !== args.swarmId) {
-            return { output: `only the coordinator of this swarm may answer its permission prompts (you coordinate '${caller.swarmId}')` };
           }
           if (!args.permissionId) return { output: "reply requires permissionId" };
           if (!args.response) return { output: "reply requires response ('once' | 'always' | 'reject')" };
@@ -5014,8 +5130,9 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller) return { output: "calling session is not a swarm member" };
+          // Multi-own (migration v12): the caller's row within THIS swarm.
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) return { output: "calling session is not a member of this swarm" };
           const swarm = await core.store.getSwarm(args.swarmId);
           if (!swarm) return { output: `no swarm '${args.swarmId}'` };
 
@@ -5046,12 +5163,10 @@ export async function swarmPlugin(
             return { output: lines.join("\n") };
           }
 
-          // action === "ladder" — coordinator of THIS swarm only.
+          // action === "ladder" — coordinator of THIS swarm only (swarm-scoped
+          // lookup above already guarantees membership in this swarm).
           if (caller.role !== "coordinator") {
             return { output: `swarm_stalls ladder is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
-          }
-          if (caller.swarmId !== args.swarmId) {
-            return { output: `only the coordinator of this swarm may advance its members (you coordinate '${caller.swarmId}')` };
           }
           if (!args.member) return { output: "ladder requires 'member' (the member name to advance one rung)" };
           try {
@@ -5094,8 +5209,12 @@ export async function swarmPlugin(
           const rt = await ensureRt();
           const core = rt.core;
           args.swarmId = await core.resolveSwarmId(args.swarmId, input.project?.id ?? "global");
-          const caller = await core.store.getMemberBySessionId(ctx.sessionID);
-          if (!caller) return { output: "calling session is not a swarm member" };
+          // Multi-own (migration v12): the list path is the cross-swarm
+          // deliverable bus — any member of ANY swarm may read ANY swarm's
+          // ledger, so membership here is first-match (some swarm). The verdict
+          // path re-resolves SWARM-SCOPED below.
+          const anyCaller = await core.store.getMemberBySessionId(ctx.sessionID);
+          if (!anyCaller) return { output: "calling session is not a swarm member" };
 
           // list — any member may read ANY swarm's ledger (cross-swarm
           // deliverable bus). The caller must be a registered member of SOME
@@ -5144,11 +5263,25 @@ export async function swarmPlugin(
           // action === "verdict" — coordinator OF THE DELIVERABLE'S SWARM only
           // (the authority for the member's work; a worker or a foreign
           // coordinator gets a clear rejection, mirroring swarm_permissions).
+          // Multi-own (migration v12): the authority resolves SWARM-SCOPED — a
+          // session that is worker-in-A and coordinator-of-B may verdict B but
+          // not A. Denial messages distinguish a foreign coordinator from a
+          // plain worker (kept for the cross-swarm deliverable bus test).
+          const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+          if (!caller) {
+            const rows = await core.store.listMembersBySessionId(ctx.sessionID);
+            const foreignCoord = rows.find((m) => m.role === "coordinator");
+            if (foreignCoord) {
+              return { output: `only the coordinator of this swarm may verdict its deliverables (you coordinate '${foreignCoord.swarmId}')` };
+            }
+            const any = rows[0];
+            if (any) {
+              return { output: `swarm_deliverables verdict is coordinator-only (you are '${any.name}', role '${any.role}')` };
+            }
+            return { output: "calling session is not a swarm member" };
+          }
           if (caller.role !== "coordinator") {
             return { output: `swarm_deliverables verdict is coordinator-only (you are '${caller.name}', role '${caller.role}')` };
-          }
-          if (caller.swarmId !== args.swarmId) {
-            return { output: `only the coordinator of this swarm may verdict its deliverables (you coordinate '${caller.swarmId}')` };
           }
           if (!args.deliverableId) return { output: "verdict requires deliverableId" };
           if (!args.verdict) return { output: "verdict requires verdict ('accepted' | 'rejected')" };

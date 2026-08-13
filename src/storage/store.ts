@@ -56,7 +56,26 @@ export interface SwarmStoreTx {
   updateSwarmStatus(swarmId: string, status: Swarm["status"]): Promise<void>;
   listMembers(swarmId: string): Promise<SwarmMember[]>;
   getMemberById(memberId: string): Promise<SwarmMember | undefined>;
+  /** FIRST-MATCH session lookup (backward compat): returns the first member
+   * row with that session. With multi-own (migration v12) a session may own N
+   * swarms — callers resolving a member within a SPECIFIC swarm must use
+   * getMemberBySessionAndSwarm instead. */
   getMemberBySessionId(sessionID: string): Promise<SwarmMember | undefined>;
+  /** Multi-own (migration v12): ALL member rows with this session across every
+   * swarm, created_at order. Powers per-session effects (human-chat pause,
+   * session-event reduction) that must apply to every swarm the session
+   * belongs to. */
+  listMembersBySessionId(sessionID: string): Promise<SwarmMember[]>;
+  /** Multi-own (migration v12): the exact (session, swarm) member row — the
+   * swarm-scoped coordinator lookup. Every 'the coordinator member of swarm X'
+   * resolution MUST go through this so swarm B's operations never pick up
+   * swarm A's coordinator row. */
+  getMemberBySessionAndSwarm(sessionID: string, swarmId: string): Promise<SwarmMember | undefined>;
+  /** Multi-own (migration v12): every swarm this session is a member of
+   * (distinct by swarm id). The swarms the session OWNS/coordinates are those
+   * whose coordinatorSessionId is the session — callers filter when ownership
+   * semantics matter. */
+  listSwarmsBySession(sessionID: string): Promise<Swarm[]>;
   getMemberByName(swarmId: string, name: string): Promise<SwarmMember | undefined>;
   listTasks(swarmId: string): Promise<SwarmTask[]>;
   listTaskDependencies(swarmId: string): Promise<TaskDependency[]>;

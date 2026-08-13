@@ -732,16 +732,26 @@ describe("swarm tools", () => {
     expect(statusText).toContain("verify pack");
   });
 
-  test("swarm_delegate with a DIFFERENT name than the session's swarm gives clear guidance", async () => {
+  test("swarm_delegate with a DIFFERENT name than the session's swarm creates a SECOND swarm (multi-own)", async () => {
     const tag = Math.random().toString(36).slice(2, 8);
-    await tool.swarm_create.execute({ name: `tool-one-${tag}` }, ctx(`ses-tool-lead-${tag}`));
+    const sessionID = `ses-tool-lead-${tag}`;
+    await tool.swarm_create.execute({ name: `tool-one-${tag}` }, ctx(sessionID));
     const del = await tool.swarm_delegate.execute(
       { name: `tool-two-${tag}`, members: [{ name: "m", role: "r", prompt: "x" }] },
-      ctx(`ses-tool-lead-${tag}`),
+      ctx(sessionID),
     );
-    // Must NOT throw a raw UNIQUE error — a clear actionable message instead.
-    expect(String(del.output ?? del)).toContain("already owns swarm");
-    expect(String(del.output ?? del)).toContain("swarm_delete");
+    // Multi-own (migration v12): a different name CREATES a new swarm owned by
+    // the same session — the old "already owns swarm" refusal is gone. Must not
+    // throw a raw UNIQUE error and must return a working swarm.
+    const out = JSON.parse(String(del.output ?? del));
+    expect(out.swarmId).toBeDefined();
+    expect(out.members.length).toBe(1);
+    // The session now owns BOTH swarms.
+    const rt = await import("../../src/plugin.ts").then((m) => m.swarmRuntime());
+    const owned = await rt!.store.listSwarmsBySession(sessionID);
+    expect(owned.length).toBe(2);
+    expect(owned.some((s) => s.name === `tool-one-${tag}`)).toBe(true);
+    expect(owned.some((s) => s.name === `tool-two-${tag}`)).toBe(true);
   });
 
   test("re-delegating to an existing member re-asserts the task", async () => {
