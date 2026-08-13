@@ -34,6 +34,16 @@ export interface WakePlan {
   shouldWake: boolean;
 }
 
+/** External effects a state reduction asks the caller to perform after commit. */
+export interface SupervisorEffects {
+  wake: string[];
+  notifyCoordinator: boolean;
+  /** Task ids released by this event's state reduction (session.error /
+   * session.deleted): the caller notifies dependents and re-kicks the
+   * scheduler for immediate reassignment. */
+  releasedTaskIds?: string[];
+}
+
 /**
  * Event-driven supervisor. Reduces OpenCode events into durable state changes
  * and external effects (wakeups). Deterministic; never polls.
@@ -53,8 +63,8 @@ export class Supervisor {
    * Handle one OpenCode event. Returns the set of effects the caller must
    * execute AFTER durable state is committed.
    */
-  async onOpenCodeEvent(event: OpenCodeEvent): Promise<{ wake: string[]; notifyCoordinator: boolean }> {
-    const effects: { wake: string[]; notifyCoordinator: boolean } = { wake: [], notifyCoordinator: false };
+  async onOpenCodeEvent(event: OpenCodeEvent): Promise<SupervisorEffects> {
+    const effects: SupervisorEffects = { wake: [], notifyCoordinator: false };
 
     const sessionID =
       (event.properties as { sessionID?: string })?.sessionID ??
@@ -107,14 +117,22 @@ export class Supervisor {
             effects.notifyCoordinator = false;
             break;
           }
-          await this.store.updateMemberStatus(member.id, "failed", { lastActiveAt: now });
-          // A failed member's in-flight task is orphaned (it will never complete
-          // it). Release it back to 'ready' so another idle member can pick it
-          // up — otherwise the task blocks the DAG forever.
+          // A session/provider error is a SYSTEMIC failure, NOT the member
+          // failing the task (the ANVIL outage failed EVERY member at once). So:
+          //  1. release the in-flight task WITHOUT consuming the retry budget
+          //     (countAsRetry:false) — genuine task-level failures are the only
+          //     consumers of the retry budget;
+          //  2. put the member IDLE (currentTaskId null) so the scheduler can
+          //     re-assign it — AND the member — on the next pass. Never leave a
+          //     taskless 'working'/'failed' member in limbo ('all members
+          //     working but t-setup still ready with no owner').
+          //  3. surface the released task id so the caller notifies dependents
+          //     and kicks the scheduler immediately.
           if (member.currentTaskId) {
-            await this.store.releaseTask(member.currentTaskId);
+            await this.store.releaseTask(member.currentTaskId, { countAsRetry: false });
+            effects.releasedTaskIds = [...(effects.releasedTaskIds ?? []), member.currentTaskId];
           }
-          await this.store.updateMemberStatus(member.id, "failed", { currentTaskId: null, lastActiveAt: now });
+          await this.store.updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: now });
           effects.notifyCoordinator = true;
           break;
         case "session.deleted":

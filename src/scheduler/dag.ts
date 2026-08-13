@@ -3,26 +3,80 @@ import type { TaskDependency } from "../storage/models.js";
 
 export type TaskGraph = Map<string, string[]>;
 
+/** Generic low-information words stripped from affinity tokens — a bare
+ * shared generic like 'task'/'the'/'swarm' must not produce affinity (it is
+ * not a signal of who should own the work). */
+const GENERIC_WORDS: ReadonlySet<string> = new Set([
+  "task", "the", "and", "swarm", "feature", "a", "an", "for", "to", "of",
+  "with", "this", "that", "from", "in", "on", "by", "it", "is", "are", "be",
+  "do", "you", "your", "work", "member", "role", "team", "as", "at", "or",
+  "all", "any", "each", "new", "one", "use", "using", "into", "over", "out",
+]);
+
+/** Minimum length for a token to be a significant affinity signal. */
+const MIN_TOKEN_LENGTH = 3;
+
+/** Tokenize text for affinity: lowercase, split on non-alphanumerics, drop
+ * short and generic low-information tokens. Both member (name/role) and task
+ * text go through this, so scoring compares SIGNIFICANT tokens only. */
+export function affinityTokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= MIN_TOKEN_LENGTH && !GENERIC_WORDS.has(t));
+}
+
+/** Strong verbatim signal: the member's FULL NAME appears as a whole unit
+ * (word or hyphenated phrase) in the task text. Kept winning over token
+ * accumulation — an exact-title match is the clearest "this task is for you"
+ * signal and preserves the scheduler's original exact-match behavior. */
+const VERBATIM_NAME_SCORE = 100;
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
  * Affinity score of a member (by name/role tokens) against a task's text.
  * Used by the scheduler to hand a ready task to the specialist whose role best
  * matches it (e.g. the editor for "Combine haikus"), instead of the
  * alphabetically-first idle peer. 0 = no affinity (fallback order).
+ *
+ * Tighter scoring (scheduler-affinity fix): a bare substring or single shared
+ * token is NOT affinity — at least 2 significant tokens in common (after
+ * stripping generics like 'task'/'the'/'swarm') are required, and role tokens
+ * carry a bonus (a role that literally describes the work beats a coincidental
+ * name overlap). The member's exact name appearing verbatim in the task text
+ * still wins outright (exact-title matches preserved).
  */
 export function affinityScore(name: string, role: string, taskText: string): number {
   if (!taskText) return 0;
-  const tokens = [
-    ...new Set(
-      [...name.toLowerCase().split(/[^a-z0-9]+/), ...role.toLowerCase().split(/[^a-z0-9]+/)]
-        .filter((t) => t.length >= 3),
-    ),
-  ];
-  const words = taskText.toLowerCase().split(/\b/);
-  let score = 0;
-  for (const tok of tokens) {
-    if (words.includes(tok)) score += 4; // whole-token match — strong
-    else if (taskText.toLowerCase().includes(tok)) score += 1; // substring — weak
+  const lower = taskText.toLowerCase();
+  // Verbatim exact-name match — the strongest signal, kept winning.
+  const namePhrase = name.toLowerCase().trim();
+  if (
+    namePhrase.length >= MIN_TOKEN_LENGTH &&
+    new RegExp(`(^|[^a-z0-9])${escapeRegExp(namePhrase)}($|[^a-z0-9])`).test(lower)
+  ) {
+    return VERBATIM_NAME_SCORE;
   }
+  const taskTokens = new Set(affinityTokens(lower));
+  if (taskTokens.size === 0) return 0;
+  const common = new Set<string>();
+  let roleCommon = 0;
+  for (const t of affinityTokens(name)) if (taskTokens.has(t)) common.add(t);
+  for (const t of affinityTokens(role)) {
+    if (taskTokens.has(t)) {
+      common.add(t);
+      roleCommon++;
+    }
+  }
+  // Tighter scoring: at least 2 significant tokens in common, or 0. A single
+  // shared token (e.g. every 'search-*' member sharing 'search') is not a
+  // reliable ownership signal and caused the affinity misassignments.
+  if (common.size < 2) return 0;
+  let score = common.size * 4;
+  score += roleCommon * 2; // role-match bonus: roles that describe the work rank higher
   return score;
 }
 

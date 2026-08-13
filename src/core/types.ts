@@ -68,6 +68,12 @@ export interface SwarmPolicies {
    * scheduler falls back to affinity assignment. Prevents a reserved task from
    * starving when the intended owner is busy/stopped/never-spawned. */
   reservationTtlMs?: number;
+  /** Coordinator-reassign stickiness window (ms): after an explicit swarm_tasks
+   * 'reassign', the affinity sweep must NOT re-grab or re-assign that task for
+   * this long — it stays reserved for its new owner (unless the intended
+   * member is unavailable, then it falls through to affinity with a
+   * claimWarning). Falls back to reservationTtlMs, then 10 min. */
+  taskStickyMs?: number;
   maxRetriesPerTask: number;
   /** How many failed delivery attempts a message may have before it is marked
    * `failed` and the sender is notified. Defaults to 3. (audit/messaging F-M5:
@@ -78,6 +84,17 @@ export interface SwarmPolicies {
    * before swarm machinery (mail delivery, task continuation, scheduler
    * assignment) auto-resumes for that member. Default 5 minutes. */
   humanChatLullMs?: number;
+  /** Watchdog silence window (ms): how long a `working` member's session may
+   * go without producing messages before the watchdog nudges it, then
+   * escalates to respawn/release. Default 5 minutes (the historical
+   * WATCHDOG_SILENT_MS constant). Policy-overridable so long-model-call
+   * swarms can widen it without code changes. */
+  watchdogSilenceMs?: number;
+  /** Watchdog strike ceiling: consecutive silent sweeps (each sweep = one
+   * `watchdogSilenceMs` window) before the watchdog escalates past the nudge
+   * to respawn-on-absent / release. Default 3 (the historical
+   * WATCHDOG_MAX_STRIKES constant). */
+  watchdogMaxStrikes?: number;
 }
 
 export const DEFAULT_POLICIES: SwarmPolicies = {
@@ -95,6 +112,8 @@ export const DEFAULT_POLICIES: SwarmPolicies = {
   retention: "project",
   humanChatLullMs: 300_000,
   reservationTtlMs: 600_000,
+  watchdogSilenceMs: 300_000,
+  watchdogMaxStrikes: 3,
 };
 
 /** Default delivery-attempt budget for messages (audit/messaging F-M5). */
@@ -248,13 +267,17 @@ export interface SwarmTask {
    * claimed/working tasks past this timestamp. */
   leaseExpiresAt?: number;
   /** Member NAME the coordinator explicitly bound this task to at delegation
-   * (member.taskId). The scheduler prefers this member when the task becomes
-   * ready (later-ready DAG tasks included) — explicit intent beats affinity.
-   * Cleared on claim/release; updated on reassign. */
+   * (member.taskId) or at REASSIGN (reassignTask writes reservedFor + a fresh
+   * reservedAt). The scheduler prefers this member when the task becomes ready
+   * (later-ready DAG tasks included) and, within the sticky window
+   * (policies.taskStickyMs), refuses to re-grab the task by affinity — an
+   * explicit coordinator reassign must survive a release. Cleared on claim;
+   * preserved/refreshed on release. */
   reservedFor?: string;
-  /** Epoch-ms when the reservation was written; the scheduler releases a
-   * reservation after policies.reservationTtlMs so a never-eligible intended
-   * owner cannot starve the task (S-15 class). */
+  /** Epoch-ms when the reservation/sticky marker was written; the scheduler
+   * releases a reservation after policies.taskStickyMs (falls back to
+   * reservationTtlMs) so a never-eligible intended owner cannot starve the
+   * task (S-15 class), and re-engages affinity after the window. */
   reservedAt?: number;
   createdAt: number;
   updatedAt: number;

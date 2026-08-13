@@ -88,14 +88,22 @@ export class Recovery {
           try {
             const newSessionId = await this.respawn(member);
             await this.store.assignMemberSession(member.id, newSessionId);
-            await this.store.updateMemberStatus(member.id, "working", { currentTaskId: member.currentTaskId ?? null, lastActiveAt: Date.now() });
+            // NO WORKING-LIMBO: a respawned member whose task was released (or
+            // never had one) must come back IDLE so the scheduler can engage it
+            // on the next pass — only a member that still owns its task comes
+            // back 'working' (it was re-claimed + re-prompted by respawnMember).
+            const hasTask = !!member.currentTaskId;
+            await this.store.updateMemberStatus(member.id, hasTask ? "working" : "idle", {
+              currentTaskId: member.currentTaskId ?? null,
+              lastActiveAt: Date.now(),
+            });
             actions.push({
               memberId: member.id,
               memberName: member.name,
               previousStatus: member.status,
               runtimeStatus: "absent",
               action: "respawned",
-              detail: `session absent; re-spawned as ${newSessionId}`,
+              detail: `session absent; re-spawned as ${newSessionId}${hasTask ? "" : " (no task — idle, scheduler will assign)"}`,
             });
             continue;
           } catch (err) {
@@ -110,9 +118,11 @@ export class Recovery {
             });
           }
         }
-        // Release any owned task back to ready so it can be reassigned.
+        // Release any owned task back to ready so it can be reassigned. The
+        // vanished session + failed respawn is NOT the task's fault — never
+        // consume the retry budget on this path (W-1, mirrors the watchdog).
         if (member.currentTaskId) {
-          await this.store.releaseTask(member.currentTaskId);
+          await this.store.releaseTask(member.currentTaskId, { countAsRetry: false });
         }
         await this.store.updateMemberStatus(member.id, "interrupted", { currentTaskId: null, lastActiveAt: Date.now() });
         if (!actions.some((a) => a.memberId === member.id)) {

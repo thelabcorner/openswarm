@@ -67,6 +67,17 @@ const PERM_POLL_THROTTLE_MS = 5_000;
  * (mirrors the notifiedPermissionIds once-per-prompt guarantee). */
 const PROVIDER_ERROR_NOTIFY_DEDUP_MS = 15 * 60_000;
 
+/** Advisory flood cap (t-sched-robustness): at most ONE allow-all /
+ * provider-error advisory per member per window, and at most
+ * ADVISORY_PER_SWARM_MAX per swarm per window, so a noisy taskless member
+ * probing temp dirs cannot flood the coordinator with [PERMISSION ALLOWED] /
+ * [CHAT FAILURE] findings (the ANVIL 'format member stuck in a noise loop'
+ * failure). Purely advisory — the member's action already happened; this only
+ * bounds how often the coordinator is told. The per-id / per-subtype dedup
+ * (allowAllAdvisedIds / notifiedProviderErrors) is kept AS-IS on top. */
+const ADVISORY_PER_MEMBER_MS = 5 * 60_000;
+const ADVISORY_PER_SWARM_MAX = 3;
+
 /** Truncate long blackboard values in list/search output so the tool stays
  * readable while still surfacing content (premium UX: a member can see what a
  * deliverable is without guessing keys or doing a separate get). */
@@ -491,6 +502,14 @@ export class SwarmPluginRuntime implements StallHost {
    * advisories — ONE advisory per ask id, never more (a re-raise of the same
    * ask must not re-notify). */
   private allowAllAdvisedIds = new Set<string>();
+  /** Advisory flood cap (t-sched-robustness): per-member last allowed advisory
+   * time (ms) — at most one [PERMISSION ALLOWED] / [CHAT FAILURE] advisory per
+   * member per ADVISORY_PER_MEMBER_MS window. */
+  private advisoryMemberLastAt = new Map<string, number>();
+  /** Advisory flood cap (t-sched-robustness): per-swarm { count, windowStart }
+   * of allowed advisories — at most ADVISORY_PER_SWARM_MAX per swarm per
+   * window, so one noisy member can't flood the coordinator. */
+  private advisorySwarmCount = new Map<string, { count: number; windowStart: number }>();
   /** t-perm-lifecycle polling backstop: per-member-session last poll time (ms).
    * The stall diagnoser polls the server's pending-ask GET endpoints at most
    * once per session per window so a diagnose pass can never hammer the server. */
@@ -1073,7 +1092,12 @@ export class SwarmPluginRuntime implements StallHost {
    * has gone silent for too long is stuck mid-loop (e.g. on a never-completing
    * tool call) and emits no idle/error event for the supervisor to act on.
    * Detect that via `getMessages` liveness, re-drive the member with a nudge,
-   * and if it stays silent escalate by releasing its task so the DAG advances.
+   * and if it stays silent escalate: an ABSENT session (runtime.getSession
+   * returns null — not merely silent) is RESPAWNED so the task stays with the
+   * member (re-claimed + re-prompted); only when the respawn fails is the task
+   * released — WITHOUT consuming the retry budget (a stall is not the task's
+   * fault; budget is reserved for genuine failures). Thresholds are
+   * policy-overridable via SwarmPolicies.watchdogSilenceMs / watchdogMaxStrikes.
    */
   private static readonly WATCHDOG_SILENT_MS = 5 * 60_000;
   private static readonly WATCHDOG_MAX_STRIKES = 3;
@@ -1086,6 +1110,12 @@ export class SwarmPluginRuntime implements StallHost {
     if (!swarm || swarm.status !== "active") return;
     const members = await this.store.listMembers(swarmId);
     const now = Date.now();
+    // Policy knobs (W-3): the silence window and the strike ceiling are
+    // overridable per swarm — a deployment with long model calls can widen
+    // them without code changes; tests set tiny values to fire the watchdog
+    // quickly. Defaults mirror the historical constants.
+    const silenceMs = swarm.policies.watchdogSilenceMs ?? SwarmPluginRuntime.WATCHDOG_SILENT_MS;
+    const maxStrikes = swarm.policies.watchdogMaxStrikes ?? SwarmPluginRuntime.WATCHDOG_MAX_STRIKES;
 
     for (const m of members) {
       if (m.role === "coordinator") continue;
@@ -1111,7 +1141,7 @@ export class SwarmPluginRuntime implements StallHost {
           // leave latest as-is
         }
       }
-      const silent = now - latest > SwarmPluginRuntime.WATCHDOG_SILENT_MS;
+      const silent = now - latest > silenceMs;
 
       // Working-with-no-task limbo (F4): a member marked `working` with NO
       // currentTaskId is not in the scheduler's idle pool (never assigned), is
@@ -1158,15 +1188,51 @@ export class SwarmPluginRuntime implements StallHost {
           console.error(`[swarm] watchdog nudge to ${m.name} failed:`, err);
         });
         console.warn(`[swarm] watchdog: ${m.name} silent, nudging (strike 1)`);
-      } else if (strikes >= SwarmPluginRuntime.WATCHDOG_MAX_STRIKES && taskId) {
-        // Escalated: release the task so another member can take it, and mark
-        // the member interrupted. Notify the coordinator.
-        await this.store.releaseTask(taskId).catch(() => undefined);
+      } else if (strikes >= maxStrikes && taskId) {
+        // Escalated. RESPAWN-ON-ABSENT (W-2): first distinguish an ABSENT
+        // session (runtime.getSession returns null — crashed/vanished, a
+        // respawn candidate) from a merely SILENT one (still alive, just not
+        // producing messages). An absent member was assigned the task by
+        // affinity and then went dark — releasing it just re-queues the task
+        // for another member while the dead session lingers. Instead, respawn
+        // it via the SAME respawn path recovery uses (respawnMember), which
+        // re-claims the task and re-prompts the fresh session. Only when the
+        // respawn fails AND the session is still absent do we release.
+        const absent = await this.sessionAbsent(m.sessionId);
+        if (absent) {
+          try {
+            const newSessionId = await this.respawnMember(m);
+            if (newSessionId) {
+              // Respawned: the task was released (countAsRetry:false, not the
+              // task's fault), re-claimed by the member, and the fresh session
+              // was re-prompted inside respawnMember. Keep the task with the
+              // member — reset strikes + liveness so the new session gets a
+              // full silence window before any further escalation.
+              this.watchdogStrikes.delete(m.id);
+              this.lastSeenActivity.set(m.id, Date.now());
+              await this.store.updateMemberStatus(m.id, "working", { currentTaskId: taskId, lastActiveAt: now }).catch(() => undefined);
+              this.notifyCoordinator(
+                { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
+                `Watchdog: ${m.name}'s session was ABSENT — respawned it (${newSessionId}); task "${taskId}" stays with the member (re-claimed + re-prompted).`,
+              );
+              console.warn(`[swarm] watchdog: respawned absent member ${m.name} (${newSessionId}); task ${taskId} kept`);
+              continue;
+            }
+          } catch (err) {
+            // Respawn failed — fall through to the release path below.
+            console.error(`[swarm] watchdog: respawn of absent member ${m.name} failed:`, (err as Error).message);
+          }
+        }
+        // Release WITHOUT consuming the retry budget (W-1): a watchdog release
+        // is a stall / vanished session, NOT the task's fault. Retry budget is
+        // reserved for genuine failures (kickoff errors, member-failed flows),
+        // so churning a silent member can never fail the task outright.
+        await this.store.releaseTask(taskId, { countAsRetry: false }).catch(() => undefined);
         await this.store.updateMemberStatus(m.id, "interrupted", { currentTaskId: null, lastActiveAt: now }).catch(() => undefined);
         this.watchdogStrikes.delete(m.id);
         this.notifyCoordinator(
           { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
-          `Watchdog released "${taskId}" from ${m.name}: session was silent for ${Math.round((SwarmPluginRuntime.WATCHDOG_SILENT_MS * strikes) / 60_000)} min. Task re-queued.`,
+          `Watchdog released "${taskId}" from ${m.name}: session was silent for ${Math.round((silenceMs * strikes) / 60_000)} min${absent ? " (absent; respawn failed)" : ""}. Task re-queued (retry budget NOT consumed).`,
         );
         // F6: the watchdog released an upstream task — tell dependent owners.
         await this.notifyDependents(swarmId, taskId, `released by watchdog (${m.name} stalled)`).catch((err) => {
@@ -1174,6 +1240,17 @@ export class SwarmPluginRuntime implements StallHost {
         });
         console.warn(`[swarm] watchdog: released ${taskId} from ${m.name} after ${strikes} strikes`);
       }
+    }
+  }
+
+  /** True when a session is ABSENT from the runtime (getSession returns null —
+   * crashed/deleted), as opposed to merely silent. A runtime error is treated
+   * as "present" so an unreachable server never triggers a release cascade. */
+  private async sessionAbsent(sessionId: string): Promise<boolean> {
+    try {
+      return (await this.runtime.getSession(sessionId)) == null;
+    } catch {
+      return false;
     }
   }
 
@@ -1209,9 +1286,16 @@ export class SwarmPluginRuntime implements StallHost {
     await this.store.assignMemberSession(member.id, session.id);
 
     // If the member owned a task, re-claim it (it was released by recovery) and
-    // re-kick the member on it so work continues without a human.
+    // re-kick the member on it so work continues without a human. W-2: when the
+    // task is STILL owned/working (session vanished mid-task — the watchdog's
+    // respawn-on-absent case), release it FIRST with countAsRetry:false so the
+    // re-claim below succeeds and the fresh session is actually re-prompted.
+    // A vanished session is never the task's fault, so the retry budget is not
+    // consumed. Terminal / already-ready tasks are untouched (releaseTask and
+    // claimTask are no-ops for them).
     const taskId = member.currentTaskId;
     if (taskId) {
+      await this.store.releaseTask(taskId, { countAsRetry: false }).catch(() => undefined);
       const claimed = await this.store.claimTask(taskId, member.id, swarmTaskLeaseMs(swarm));
       if (claimed) {
         const tasks = await this.store.listTasks(swarm.id);
@@ -1371,6 +1455,19 @@ export class SwarmPluginRuntime implements StallHost {
         this.notifyCoordinator(
           { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
           `[RESERVATION] task ${f.taskId} freed to affinity assignment: ${f.reason}`,
+        );
+      }
+    }
+    // Coordinator-stickiness fallthroughs: a task explicitly reassigned by the
+    // coordinator was freed to affinity WITHIN the sticky window because its
+    // intended owner is unavailable (stopped/stopping/failed/interrupted or
+    // absent) — surface WHY so the coordinator's reassign intent is visible,
+    // not silently dropped.
+    if (result && result.stickyFallthroughs.length > 0) {
+      for (const f of result.stickyFallthroughs) {
+        this.notifyCoordinator(
+          { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
+          `[STICKY] task ${f.taskId} (${fence(f.taskTitle)}) fell through to affinity assignment: ${f.reason}`,
         );
       }
     }
@@ -1690,6 +1787,37 @@ export class SwarmPluginRuntime implements StallHost {
   }
 
   /**
+   * Advisory flood gate (t-sched-robustness): shared rate cap for advisory
+   * coordinator findings ([PERMISSION ALLOWED] / [CHAT FAILURE]). At most ONE
+   * advisory per member per ADVISORY_PER_MEMBER_MS window, and at most
+   * ADVISORY_PER_SWARM_MAX per swarm per window, so a noisy taskless member
+   * cannot flood the coordinator's mailbox (the ANVIL 'format member stuck in
+   * a noise loop' failure). Returns true when the advisory may proceed; the
+   * caller's existing per-id / per-subtype dedup is kept on top. Suppressed
+   * advisories are logged at debug so the cap stays auditable.
+   */
+  private advisoryAllowed(memberId: string, swarmId: string): boolean {
+    const now = Date.now();
+    const last = this.advisoryMemberLastAt.get(memberId) ?? 0;
+    if (now - last < ADVISORY_PER_MEMBER_MS) {
+      console.debug(`[swarm] advisory suppressed for member ${memberId} (rate cap ${ADVISORY_PER_MEMBER_MS}ms)`);
+      return false;
+    }
+    const swarmState = this.advisorySwarmCount.get(swarmId);
+    if (swarmState && now - swarmState.windowStart < ADVISORY_PER_MEMBER_MS && swarmState.count >= ADVISORY_PER_SWARM_MAX) {
+      console.debug(`[swarm] advisory suppressed for swarm ${swarmId} (per-swarm cap ${ADVISORY_PER_SWARM_MAX}/${ADVISORY_PER_MEMBER_MS}ms)`);
+      return false;
+    }
+    this.advisoryMemberLastAt.set(memberId, now);
+    if (!swarmState || now - swarmState.windowStart >= ADVISORY_PER_MEMBER_MS) {
+      this.advisorySwarmCount.set(swarmId, { count: 1, windowStart: now });
+    } else {
+      swarmState.count++;
+    }
+    return true;
+  }
+
+  /**
    * t-perm-trace remediation: under allowAllMemberPermissions, a HIGH-RISK
    * member request (one the normal worktree scoping / inherited policy would
    * have gated to "ask"/"deny") is auto-allowed SILENTLY — nothing is
@@ -1706,6 +1834,10 @@ export class SwarmPluginRuntime implements StallHost {
   ): Promise<void> {
     if (!input.id || this.allowAllAdvisedIds.has(input.id)) return;
     this.allowAllAdvisedIds.add(input.id);
+    // Advisory flood cap: a taskless member probing temp dirs can fire a
+    // [PERMISSION ALLOWED] advisory on EVERY ask — rate-cap per member and per
+    // swarm so the coordinator's mailbox isn't flooded (dedup-by-id kept above).
+    if (!this.advisoryAllowed(member.id, swarm.id)) return;
     const coordMember = await this.store.getMemberById(swarm.coordinatorMemberId);
     const patternText = Array.isArray(input.pattern) ? input.pattern.join(", ") : input.pattern ?? input.title ?? "";
     const lines = [
@@ -2041,6 +2173,13 @@ export class SwarmPluginRuntime implements StallHost {
     const now = Date.now();
     const last = this.notifiedProviderErrors.get(key) ?? 0;
     if (now - last < PROVIDER_ERROR_NOTIFY_DEDUP_MS) return;
+    // Advisory flood cap: a member whose session keeps erroring must not flood
+    // the coordinator with [CHAT FAILURE] findings — the per-(memberId,subtype)
+    // dedup above is per class; this adds a hard per-member + per-swarm rate
+    // cap (an ANVIL-wide provider outage would otherwise hit every member at
+    // once and stack N findings). Suppressed attempts do NOT shift the dedup
+    // timestamp, so the cap cannot delay a genuinely-new failure class.
+    if (!this.advisoryAllowed(member.id, member.swarmId)) return;
     this.notifiedProviderErrors.set(key, now);
     const swarm = await this.store.getSwarm(member.swarmId);
     if (!swarm) return;
@@ -3062,12 +3201,12 @@ export async function swarmPlugin(
       }),
 
       swarm_tasks: tool({
-        description: "Inspect swarm tasks (list/claim/release/reassign/complete/fail/cancel). list shows DAG-aware rows + next-action summary; release returns a claimed/working task to ready (note: an owner releasing a task counts as one retry attempt, bounded by maxRetriesPerTask); coordinator may reassign a task to a different member.",
+        description: "Inspect swarm tasks (list/claim/release/reassign/complete/fail/cancel/retry). list shows DAG-aware rows + next-action summary; release returns a claimed/working task to ready (note: an owner releasing a task counts as one retry attempt, bounded by maxRetriesPerTask); coordinator may reassign a task to a different member; coordinator-only retry resets a FAILED/CANCELLED task to ready with a fresh retry budget.",
         args: {
           swarmId: tool.schema.string(),
-          action: tool.schema.enum(["list", "claim", "release", "reassign", "complete", "fail", "cancel"]).describe("Action."),
-          taskId: tool.schema.string().optional().describe("Required for claim/release/reassign/complete/fail/cancel."),
-          member: tool.schema.string().optional().describe("Target member name (required for reassign)."),
+          action: tool.schema.enum(["list", "claim", "release", "reassign", "complete", "fail", "cancel", "retry"]).describe("Action."),
+          taskId: tool.schema.string().optional().describe("Required for claim/release/reassign/complete/fail/cancel/retry."),
+          member: tool.schema.string().optional().describe("Target member name (required for reassign; optional for retry — reserves the retried task for that member)."),
         },
         async execute(args, ctx) {
           const rt = await ensureRt();
@@ -3396,6 +3535,57 @@ export async function swarmPlugin(
               await rt.runScheduler(args.swarmId);
             }
             return { output: `${args.action}: ${task.id}` };
+          }
+          if (args.action === "retry" && args.taskId) {
+            // Coordinator-only task recovery (W-4): reset a FAILED or CANCELLED
+            // task back to READY with a FRESH retry budget (retry_count 0,
+            // owner + claim lease + reservation cleared). The task id and its
+            // DAG edges are preserved. An optional member name re-binds the
+            // task to that member (setTaskReservation) so the coordinator can
+            // direct who retries. This is the recovery the coordinator had no
+            // way to do before — a watchdog-failed task no longer dead-ends
+            // the tracker; it is simply retried.
+            const caller = await core.store.getMemberBySessionAndSwarm(ctx.sessionID, args.swarmId);
+            if (!caller) return { output: "calling session is not a swarm member" };
+            if (caller.role !== "coordinator") {
+              return { output: `only the coordinator may retry tasks (you are '${caller.name}')` };
+            }
+            const tasks = await core.store.listTasks(args.swarmId);
+            const task = tasks.find((t) => t.id === args.taskId);
+            if (!task) return { output: `no task '${args.taskId}'` };
+            if (args.member) {
+              const target = await core.store.getMemberByName(args.swarmId, args.member);
+              if (!target) return { output: `no member named '${args.member}'` };
+              if (["stopped", "stopping", "failed"].includes(target.status)) {
+                return { output: `cannot reserve '${args.taskId}' for '${args.member}': member is ${target.status}` };
+              }
+            }
+            const ok = await core.store.resetTaskForRetry(args.taskId);
+            if (!ok) {
+              return { output: `retry: task '${args.taskId}' is not recoverable (only failed/cancelled tasks can be retried)` };
+            }
+            if (args.member) {
+              await core.store.setTaskReservation(args.taskId, args.member);
+            }
+            // X1: the task left its terminal state — a future re-claim can
+            // notify the coordinator again.
+            rt.clearContinueNotified(args.taskId);
+            // Timeline: coordinator retried the task (task.retried).
+            await recordEvent(core.store, {
+              swarmId: args.swarmId,
+              type: "task.retried",
+              actorMemberId: caller.id,
+              entityType: "task",
+              entityId: args.taskId,
+              payloadJson: JSON.stringify({ member: args.member ?? null }),
+            });
+            // The task is ready again — advance the DAG so it is picked up
+            // promptly (unlike release, retry is the coordinator actively
+            // re-queueing work, so an immediate scheduler pass is desired).
+            await rt.runScheduler(args.swarmId);
+            return {
+              output: `retry: task '${args.taskId}' reset to ready (fresh retry budget)${args.member ? `, reserved for '${args.member}'` : ""}`,
+            };
           }
           return { output: "action requires taskId" };
         },
@@ -6178,19 +6368,32 @@ export async function handleOpenCodeEvent(
       if (member) {
         const swarm = await store.getSwarm(member.swarmId);
         if (swarm && swarm.status === "active") {
-          const errorText = (event.properties as { error?: string })?.error ?? "";
+          // [object Object] fix: the error payload may be an OBJECT (OpenCode
+          // emits { name, message, stack }) — interpolating it raw renders
+          // '[object Object]' in the notice (the ANVIL 'failed: [object Object]'
+          // failure). Normalize with the module helper; empty for undefined.
+          const rawErr = (event.properties as { error?: unknown })?.error;
+          const errLine = errorText(rawErr);
           rt.notifyCoordinator(
             { id: swarm.id, name: swarm.name, coordinatorSessionId: swarm.coordinatorSessionId },
-            `${member.name} failed${errorText ? `: ${errorText}` : ""}. Its task was released for reassignment.`,
+            `${member.name} failed${errLine ? `: ${errLine}` : ""}. Its task was released for reassignment.`,
           );
           // F6: a genuine failure released the member's task — notify dependent
           // task owners so they re-validate rather than discovering silently.
-          const taskId = member.currentTaskId;
-          if (taskId) {
+          // The released task id comes from the supervisor (the member row was
+          // already cleared of currentTaskId when it went idle).
+          for (const taskId of effects.releasedTaskIds ?? []) {
             await rt.notifyDependents(swarm.id, taskId, `released after ${member.name} failed`).catch((err) => {
               console.error(`[swarm] dependent notification after failure failed:`, err);
             });
           }
+          // NO WORKING-LIMBO: the session-error path released the member's task
+          // and put the member IDLE — kick the scheduler NOW so the ready task
+          // is re-assigned on this pass instead of sitting unclaimed until the
+          // next sweep (the ANVIL 'ready task sat unclaimed' symptom).
+          await rt.runScheduler(swarm.id).catch((err) => {
+            console.error(`[swarm] scheduler pass after session failure failed:`, err);
+          });
         }
       }
     }

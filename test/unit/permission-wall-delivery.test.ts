@@ -328,7 +328,12 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
     expect(out1b.status).toBe("allow");
     expect((await allowAllAdvisories(swarmId)).length).toBe(1);
 
-    // (3) A NEW high-risk ask (bash outside worktree) -> a second advisory.
+    // (3) A NEW high-risk ask (bash outside worktree) within the advisory
+    // flood-cap window (t-sched-robustness): the member already got its ONE
+    // [PERMISSION ALLOWED] advisory this window (1 per member per 5 min — the
+    // ANVIL 'format member stuck in a noise loop' fix), so a distinct ask id is
+    // SUPPRESSED. The dedup-by-id guarantee above still holds; this cap is on
+    // top so a taskless member probing temp dirs can't flood the coordinator.
     const permissionAsk = hooks["permission.ask"];
     const out3 = askOutput();
     await permissionAsk!(
@@ -336,7 +341,7 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
       out3,
     );
     expect(out3.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(2);
+    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
 
     // (4) An IN-SCOPE ask (bash pattern inside the worktree ".") is allowed
     // WITHOUT an advisory (not high-risk — the normal scoping would allow it).
@@ -346,7 +351,7 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
       out4,
     );
     expect(out4.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(2);
+    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
 
     // (5) Low-risk read ops stay silent under allow-all (not in the high-risk set).
     const out5 = askOutput();
@@ -355,7 +360,7 @@ describe("b. allowAll=true — the SAME ask is auto-allowed: nothing recorded, n
       out5,
     );
     expect(out5.status).toBe("allow");
-    expect((await allowAllAdvisories(swarmId)).length).toBe(2);
+    expect((await allowAllAdvisories(swarmId)).length).toBe(1);
 
     // Still nothing pending anywhere.
     expect((await rt!.store.listPendingPermissions(swarmId)).length).toBe(0);

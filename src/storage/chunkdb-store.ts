@@ -581,9 +581,46 @@ export class ChunkDbStore implements SwarmStore {
       }
       const countAsRetry = opts?.countAsRetry ?? true;
       const now = Date.now();
+      // Coordinator-stickiness (reassign): PRESERVE an existing reservedFor
+      // marker, refreshing reservedAt so the sticky window restarts at this
+      // release — an explicit coordinator reassign must survive the release and
+      // keep the task preferred for the new owner (the affinity-misassignment
+      // bug: a release wiped the marker and the next sweep re-stole the task by
+      // name affinity). When no marker exists, a NORMAL (countAsRetry) release
+      // creates one pointing at the previous owner so the affinity sweep
+      // respects them for one grace window. Rescue releases (countAsRetry:
+      // false — kickoff failure, stall ladder, respawn) do NOT create a marker:
+      // the task is freed for a DIFFERENT member.
+      const prevOwnerName = task.ownerMemberId
+        ? this.findGlobal<SwarmMember>(NS.member, task.ownerMemberId)?.name
+        : undefined;
+      const keepMarker = task.reservedFor !== undefined && task.reservedFor !== null;
+      const nextReservedFor = keepMarker
+        ? task.reservedFor
+        : countAsRetry && prevOwnerName
+          ? prevOwnerName
+          : undefined;
       task.ownerMemberId = undefined;
       task.status = "ready";
       task.retryCount = (task.retryCount ?? 0) + (countAsRetry ? 1 : 0);
+      task.claimedAt = undefined;
+      task.leaseExpiresAt = undefined;
+      task.reservedFor = nextReservedFor;
+      task.reservedAt = nextReservedFor !== undefined ? now : undefined;
+      task.updatedAt = now;
+      this.putOne(NS.task, task.swarmId, task.id, task);
+      return true;
+    });
+  }
+
+  async resetTaskForRetry(taskId: string): Promise<boolean> {
+    return this.serialized(async () => {
+      const task = this.findGlobal<SwarmTask>(NS.task, taskId);
+      if (!task || !["failed", "cancelled"].includes(task.status)) return false;
+      const now = Date.now();
+      task.status = "ready";
+      task.ownerMemberId = undefined;
+      task.retryCount = 0;
       task.claimedAt = undefined;
       task.leaseExpiresAt = undefined;
       task.reservedFor = undefined;

@@ -1039,6 +1039,7 @@ export class SQLiteStore implements SwarmStore {
   claimTask(taskId: string, memberId: string, leaseMs?: number): Promise<boolean> { return this.serialized(() => this.tx.claimTask(taskId, memberId, leaseMs)); }
   updateTaskStatus(taskId: string, status: SwarmTask["status"]): Promise<boolean> { return this.serialized(() => this.tx.updateTaskStatus(taskId, status)); }
   releaseTask(taskId: string, opts?: { countAsRetry?: boolean }): Promise<boolean> { return this.serialized(() => this.tx.releaseTask(taskId, opts)); }
+  resetTaskForRetry(taskId: string): Promise<boolean> { return this.serialized(() => this.tx.resetTaskForRetry(taskId)); }
   setTaskReservation(taskId: string, memberName: string | null): Promise<boolean> { return this.serialized(() => this.tx.setTaskReservation(taskId, memberName)); }
   reassignTask(taskId: string, newOwnerMemberId: string): Promise<string | null> { return this.serialized(() => this.tx.reassignTask(taskId, newOwnerMemberId)); }
   listExpiredLeaseTasks(swarmId: string, now: number): Promise<SwarmTask[]> { return this.serialized(() => this.tx.listExpiredLeaseTasks(swarmId, now)); }
@@ -2093,12 +2094,51 @@ class Tx implements SwarmStoreTx {
     // S-01: releases that are NOT the task's fault (e.g. a scheduler kickoff
     // failure — the task never ran) must not consume the retry budget.
     const countAsRetry = opts?.countAsRetry ?? true;
+    const now = Date.now();
+    const task = this.db.query<RowTask, [string]>(`SELECT * FROM swarm_task WHERE id = ?`).get(taskId);
+    if (!task || !["claimed", "working", "review_pending", "changes_requested"].includes(task.status)) {
+      return false;
+    }
+    // Coordinator-stickiness (reassign): PRESERVE an existing reservedFor
+    // marker, refreshing reservedAt so the sticky window restarts at this
+    // release — an explicit coordinator reassign must survive the release and
+    // keep the task preferred for the new owner (the affinity-misassignment
+    // bug: a release wiped the marker and the next sweep re-stole the task by
+    // name affinity). When no marker exists, a NORMAL (countAsRetry) release
+    // creates one pointing at the previous owner so the affinity sweep
+    // respects them for one grace window. Rescue releases (countAsRetry:
+    // false — kickoff failure, stall ladder, respawn) do NOT create a marker:
+    // the task is freed for a DIFFERENT member.
+    const prevOwnerName = task.owner_member_id
+      ? this.db.query<RowMember, [string]>(`SELECT * FROM swarm_member WHERE id = ?`).get(task.owner_member_id)?.name
+      : undefined;
+    const keepMarker = task.reserved_for !== null && task.reserved_for !== undefined;
+    const nextReservedFor = keepMarker
+      ? task.reserved_for
+      : countAsRetry && prevOwnerName
+        ? prevOwnerName
+        : null;
     const res = this.db.run(
       `UPDATE swarm_task
        SET owner_member_id = NULL, status = 'ready',
            retry_count = retry_count + ${countAsRetry ? 1 : 0},
-           claimed_at = NULL, lease_expires_at = NULL, reserved_for = NULL, reserved_at = NULL, updated_at = ?
+           claimed_at = NULL, lease_expires_at = NULL, reserved_for = ?, reserved_at = ?, updated_at = ?
        WHERE id = ? AND status IN ('claimed','working','review_pending','changes_requested')`,
+      [nextReservedFor, nextReservedFor !== null ? now : null, now, taskId],
+    );
+    return res.changes > 0;
+  }
+
+  async resetTaskForRetry(taskId: string): Promise<boolean> {
+    // Coordinator task recovery (swarm_tasks 'retry'): a FAILED/CANCELLED task
+    // returns to READY with a fresh budget — retry_count reset, owner cleared,
+    // claim lease + reservation cleared. Id + DAG edges are untouched.
+    const res = this.db.run(
+      `UPDATE swarm_task
+       SET status = 'ready', owner_member_id = NULL, retry_count = 0,
+           claimed_at = NULL, lease_expires_at = NULL,
+           reserved_for = NULL, reserved_at = NULL, updated_at = ?
+       WHERE id = ? AND status IN ('failed','cancelled')`,
       [Date.now(), taskId],
     );
     return res.changes > 0;

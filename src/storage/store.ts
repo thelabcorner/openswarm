@@ -144,6 +144,15 @@ export interface SwarmStoreTx {
    */
   releaseTask(taskId: string, opts?: { countAsRetry?: boolean }): Promise<boolean>;
 
+  /**
+   * Coordinator task recovery (swarm_tasks action 'retry'): reset a FAILED or
+   * CANCELLED task back to READY with a FRESH retry budget — retry_count = 0,
+   * owner cleared, claim lease cleared, reservation cleared. The task id and
+   * its DAG edges are preserved. Returns false when the task is missing or not
+   * in a recoverable ('failed' | 'cancelled') state.
+   */
+  resetTaskForRetry(taskId: string): Promise<boolean>;
+
   /** Durable intended-owner binding (delegate member.taskId): the scheduler
    * prefers this member when the task becomes ready, including later-ready
    * DAG tasks. Pass null to clear. */

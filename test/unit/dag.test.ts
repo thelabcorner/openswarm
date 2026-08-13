@@ -124,10 +124,11 @@ describe("recomputeReadiness", () => {
   });
 });
 describe("affinityScore", () => {
-  test("editor role matches a combine task", () => {
-    const gamma = affinityScore("gamma", "Editor. Completes t3 by combining alpha's and beta's haikus.", "Combine haikus");
-    const alpha = affinityScore("alpha", "Haiku poet for the sea.", "Combine haikus");
+  test("editor role matches a combine task (role-match bonus)", () => {
+    const gamma = affinityScore("gamma", "Editor. Combines haiku poems.", "Combine haiku poems");
+    const alpha = affinityScore("alpha", "Sea poet.", "Combine haiku poems");
     expect(gamma).toBeGreaterThan(alpha);
+    expect(gamma).toBeGreaterThan(0);
   });
 
   test("no affinity when nothing matches (fallback order preserved)", () => {
@@ -138,6 +139,30 @@ describe("affinityScore", () => {
     const named = affinityScore("packager", "build engineer", "task for packager to run packaging");
     const generic = affinityScore("worker1", "general helper", "task for packager to run packaging");
     expect(named).toBeGreaterThan(generic);
+  });
+
+  test("tighter scoring: a single shared token is NOT affinity (>=2 significant tokens required)", () => {
+    // Every 'search-*' member shares the 'search' token — that alone must not
+    // rank anyone (the ping-pong misassignment bug). Substring matches score 0.
+    expect(affinityScore("search-core", "core backend", "search parse results")).toBe(0);
+    expect(affinityScore("timeout-fixer", "timeout recovery", "backfill nonblocking fixer")).toBe(0);
+    // One name token + one role token together ARE enough.
+    expect(affinityScore("search-core", "search parse implementation", "search parse results")).toBeGreaterThan(0);
+  });
+
+  test("role-match bonus: a role that describes the work ranks above a coincidental name overlap", () => {
+    const roleMatcher = affinityScore("alice", "rust modules compiler", "compile rust modules");
+    const nameMatcher = affinityScore("rust-modules", "cargo build tool", "compile rust modules");
+    expect(roleMatcher).toBeGreaterThan(nameMatcher);
+    expect(roleMatcher).toBeGreaterThan(0);
+    expect(nameMatcher).toBeGreaterThan(0);
+  });
+
+  test("verbatim exact-name match wins over token accumulation", () => {
+    const verbatim = affinityScore("packager", "helper", "packager run the packaging step");
+    const tokenish = affinityScore("packaging-runner", "packaging step runner", "packager run the packaging step");
+    expect(verbatim).toBeGreaterThan(tokenish);
+    expect(verbatim).toBeGreaterThan(0);
   });
 });
 

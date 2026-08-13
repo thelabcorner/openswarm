@@ -694,7 +694,8 @@ export class StallDiagnoser {
       }
       const failure = await this.scanChatFailure(swarm, m, msgs, now);
       if (failure) return failure;
-      const live = await this.memberLiveness(m, now, msgs);
+      const silenceMs = swarm.policies.watchdogSilenceMs ?? STALL_SILENT_MS;
+      const live = await this.memberLiveness(m, now, msgs, silenceMs);
       if (!live.silent) {
         return { ...base, reason: "working", stallMs: 0, evidence: ["session is producing activity"], nextAction: "none", recipe: "(none — healthy)" };
       }
@@ -789,8 +790,10 @@ export class StallDiagnoser {
   /** Liveness = newest session message (excluding this diagnoser's own nudges),
    * floored at the member's lastActiveAt/createdAt so a freshly claimed member
    * mid-kickoff is not flagged silent (mirrors the plugin watchdog's grace).
-   * `preloaded` reuses the pass's single getMessages fetch (t-fail-detect). */
-  private async memberLiveness(m: SwarmMember, now: number, preloaded?: RuntimeMessage[]): Promise<{ silent: boolean; anchor: number }> {
+   * `silenceMs` comes from swarm.policies.watchdogSilenceMs (default
+   * STALL_SILENT_MS, mirroring the watchdog). `preloaded` reuses the pass's
+   * single getMessages fetch (t-fail-detect). */
+  private async memberLiveness(m: SwarmMember, now: number, preloaded?: RuntimeMessage[], silenceMs: number = STALL_SILENT_MS): Promise<{ silent: boolean; anchor: number }> {
     let latest = this.lastSeenActivity.get(m.id) ?? 0;
     const lastNudge = this.lastNudgeAt.get(m.id) ?? 0;
     try {
@@ -808,7 +811,7 @@ export class StallDiagnoser {
       // leave latest as-is
     }
     const anchor = Math.max(latest, m.lastActiveAt ?? m.createdAt ?? 0);
-    const silent = now - anchor > STALL_SILENT_MS;
+    const silent = now - anchor > silenceMs;
     if (!silent) this.lastSeenActivity.set(m.id, anchor);
     return { silent, anchor };
   }

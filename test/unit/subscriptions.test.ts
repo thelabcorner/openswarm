@@ -151,23 +151,28 @@ describe("supervisor failure recovery", () => {
     return { swarmId: swarm.id, memberId: member.id, memberSession: member.sessionId, taskId: task.id };
   }
 
-  test("session.error marks the member failed and releases its task", async () => {
+  test("session.error releases the task (countAsRetry:false) and puts the member IDLE (t-sched-robustness)", async () => {
     const supervisor = new Supervisor(store);
     const { swarmId, memberId, memberSession, taskId } = await makeSwarmWithClaimedTask();
 
     const effects = await supervisor.onOpenCodeEvent({
       type: "session.error",
-      properties: { sessionID: memberSession, error: "boom" },
+      properties: { sessionID: memberSession, error: { name: "ProviderError", message: "upstream timeout" } },
     });
     expect(effects.notifyCoordinator).toBe(true);
+    expect(effects.releasedTaskIds).toContain(taskId);
 
     const member = await store.getMemberById(memberId);
-    expect(member?.status).toBe("failed");
+    // A session/provider error is SYSTEMIC — the member is NOT failed (that
+    // would make it non-resumable) but IDLE so the scheduler re-assigns it.
+    expect(member?.status).toBe("idle");
     expect(member?.currentTaskId).toBeUndefined();
-    // The task is released back to ready so another member can claim it.
+    // The task is released back to ready so another member (or this one) can
+    // claim it — WITHOUT consuming the retry budget.
     const task = (await store.listTasks(swarmId)).find((t) => t.id === taskId);
     expect(task?.status).toBe("ready");
     expect(task?.ownerMemberId).toBeUndefined();
+    expect(task?.retryCount).toBe(0);
   });
 
   test("session.error from an ABORT keeps the member interrupted, task claimed, no coordinator panic", async () => {

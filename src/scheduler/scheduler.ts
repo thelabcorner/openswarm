@@ -1,5 +1,5 @@
 import type { AgentRuntime } from "../runtime/runtime-types.js";
-import type { Swarm, SwarmMember, SwarmTask, PathClaim, ArtifactAnnotation } from "../core/types.js";
+import type { Swarm, SwarmMember, SwarmTask, PathClaim, ArtifactAnnotation, MemberStatus } from "../core/types.js";
 import type { SwarmStore } from "../storage/store.js";
 import { fence } from "../core/fence.js";
 import { recordEvent } from "../core/events.js";
@@ -16,6 +16,26 @@ export const DEFAULT_TASK_LEASE_MS = 30 * 60_000;
  * affinity assignment after this window if the intended owner never becomes
  * eligible (busy/stopped/never-spawned). Prevents the S-15 permanent stall. */
 export const DEFAULT_RESERVATION_TTL_MS = 10 * 60_000;
+
+/** Default coordinator-reassign stickiness window when policies.taskStickyMs
+ * (and its reservationTtlMs fallback) are unset (10 min): a task explicitly
+ * REASSIGNED by the coordinator stays reserved for its new owner — the
+ * affinity sweep must not re-grab or re-assign it by name/role affinity while
+ * the marker is fresh (the affinity-misassignment failure this iteration).
+ * Falls back to reservationTtlMs when taskStickyMs is unset. */
+export const DEFAULT_TASK_STICKY_MS = 10 * 60_000;
+
+/** Member statuses that are NOT resumable: they must never receive a task by
+ * affinity (they can still receive explicitly reserved/assigned tasks — e.g.
+ * the coordinator reassign tool, which is guarded separately). Used to filter
+ * affinity candidates AND to detect "intended owner unavailable" for sticky
+ * task fall-through. */
+export const NON_RESUMABLE: ReadonlySet<MemberStatus> = new Set([
+  "stopped",
+  "stopping",
+  "failed",
+  "interrupted",
+]);
 
 /**
  * Whether a member is currently in a human chat (within the lull window).
@@ -55,6 +75,12 @@ export interface SchedulerResult {
    * and were freed to affinity assignment. Surfaces honest "intent was X"
    * telemetry to the coordinator (S-15 class fix). */
   reservationFallbacks: Array<{ taskId: string; intendedMemberName: string; reason: string }>;
+  /** Coordinator-stickiness fallthroughs: ready tasks whose intended-owner
+   * binding is still WITHIN the sticky window but the intended member is
+   * unavailable (stopped/stopping/failed/interrupted or absent) — the affinity
+   * sweep falls through to affinity assignment WITH an advisory warning so the
+   * coordinator's reassign intent is surfaced, not silently dropped. */
+  stickyFallthroughs: Array<{ taskId: string; taskTitle: string; intendedMemberName: string; reason: string }>;
 }
 
 /** Minimum active `corpse` annotations on one path/area before the scheduler
@@ -192,7 +218,7 @@ export class Scheduler {
       annotations?: Array<Pick<ArtifactAnnotation, "path" | "type" | "authorMemberId">>;
     },
   ): Promise<SchedulerResult> {
-    const result: SchedulerResult = { assigned: [], readyUnassigned: [], activatedMembers: [], failedExceededRetries: [], claimWarnings: [], hesitationWarnings: [], reservationFallbacks: [] };
+    const result: SchedulerResult = { assigned: [], readyUnassigned: [], activatedMembers: [], failedExceededRetries: [], claimWarnings: [], hesitationWarnings: [], reservationFallbacks: [], stickyFallthroughs: [] };
     // Tasks failed this pass for exceeding maxRetriesPerTask (reported via the
     // coordinator notice in runScheduler's caller; kept in result for tests).
     const failedExceededRetries: string[] = [];
@@ -261,49 +287,94 @@ export class Scheduler {
     }
 
     // 3. Assign ready tasks to idle members, honoring concurrency limits.
-    // Durable intended-owner binding (delegate member.taskId): a task with
-    // reservedFor set is PREFERRED for that member when it becomes ready —
-    // including tasks that become ready LATER via DAG dependency resolution
-    // (the old per-pass in-memory reservation died at delegate time; the
-    // durable column fixes the S-15 class). The transient `skipAssignmentFor`
-    // set still shields tasks before the delegate's spawn pass completes.
+    // Durable intended-owner binding (delegate member.taskId) + COORDINATOR
+    // STICKINESS (explicit swarm_tasks 'reassign'): a task with reservedFor
+    // set is PREFERRED for that member when it becomes ready — including tasks
+    // that become ready LATER via DAG dependency resolution and tasks the
+    // coordinator REASSIGNED (reassignTask writes reserved_for = new owner +
+    // reserved_at = now). The affinity sweep must NOT re-grab or re-assign a
+    // sticky task while its marker is within STICKY_WINDOW_MS
+    // (policies.taskStickyMs, default 10 min) — unless the intended member is
+    // unavailable (stopped/stopping/failed/interrupted/absent), in which case
+    // it falls through to affinity WITH a claimWarning. Once the window
+    // expires, affinity re-engages (reservationFallbacks telemetry). The
+    // transient `skipAssignmentFor` set still shields tasks before the
+    // delegate's spawn pass completes.
     const reserved = opts?.skipAssignmentFor;
-    const reservationTtlMs = swarm.policies?.reservationTtlMs ?? DEFAULT_RESERVATION_TTL_MS;
+    const stickyMs =
+      swarm.policies?.taskStickyMs ??
+      swarm.policies?.reservationTtlMs ??
+      DEFAULT_TASK_STICKY_MS;
     const now = Date.now();
 
-    // Split: reserved-ready (durable binding, within TTL) vs free-ready.
-    const reservedReady: SwarmTask[] = [];
+    const idle = members
+      // R3: an idle member whose currentTaskId is still set is corrupt state
+      // (recovery/crash leftover, or a member that lost its working flag). It
+      // must NOT receive a new assignment — its old task is still owned and
+      // would strand, and its currentTaskId would be silently overwritten.
+      // Only genuinely idle, unowned members are assignment candidates.
+      .filter((m) => m.status === "idle" && m.role !== "coordinator" && !m.currentTaskId && !isChatting(m, swarm))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const memberByName = new Map(members.map((m) => [m.name, m]));
+    const idleById = new Map(idle.map((m) => [m.id, m]));
+
+    // Split: sticky-ready (durable binding, within window) vs free-ready.
+    // NOTE: `t.ownerMemberId` tasks (claimed/working) never reach this split —
+    // the affinity sweep NEVER re-grabs or reassigns an owned task.
+    const stickyReady: SwarmTask[] = [];
     const ready: SwarmTask[] = [];
     for (const t of tasks) {
       if (t.status !== "ready" || t.ownerMemberId) continue;
       if (reserved?.has(t.id)) continue; // transient shield (spawn-in-flight)
       if (t.reservedFor && t.reservedAt !== undefined) {
-        if (now - t.reservedAt > reservationTtlMs) {
-          // Reservation expired: the intended owner is busy/stopped/never
+        if (now - t.reservedAt > stickyMs) {
+          // Sticky window expired: the intended owner is busy/stopped/never
           // spawned — free the task to affinity and record the fallback.
           await this.store.setTaskReservation(t.id, null);
           result.reservationFallbacks.push({
             taskId: t.id,
             intendedMemberName: t.reservedFor,
-            reason: `reservation TTL expired (${reservationTtlMs}ms) — intended owner '${t.reservedFor}' was not eligible; freed to affinity assignment`,
+            reason: `sticky window expired (${stickyMs}ms) — intended owner '${t.reservedFor}' was not eligible; freed to affinity assignment`,
           });
           ready.push(t);
-        } else {
-          reservedReady.push(t);
+          continue;
         }
+        const intended = t.reservedFor ? memberByName.get(t.reservedFor) : undefined;
+        if (intended && idleById.has(intended.id)) {
+          stickyReady.push(t);
+          continue;
+        }
+        if (!intended || NON_RESUMABLE.has(intended.status)) {
+          // Intended owner unavailable (stopped/stopping/failed/interrupted or
+          // absent): falling through to affinity WITH an advisory claimWarning
+          // so the coordinator's reassign intent is surfaced, not silently
+          // dropped — holding the task would starve it until the window ends.
+          result.stickyFallthroughs.push({
+            taskId: t.id,
+            taskTitle: t.title,
+            intendedMemberName: t.reservedFor,
+            reason: `intended owner '${t.reservedFor}' ${intended ? `is ${intended.status}` : "is absent"} — falling through to affinity assignment`,
+          });
+          ready.push(t);
+          continue;
+        }
+        // Intended owner exists but is busy/chatting — HOLD within the sticky
+        // window; the task must NOT leak to a different member while the
+        // coordinator's intent is live (the misassignment bug this fixes).
+        result.readyUnassigned.push(t.id);
       } else {
         ready.push(t);
       }
     }
     ready.sort((a, b) => b.priority - a.priority);
-    reservedReady.sort((a, b) => b.priority - a.priority);
+    stickyReady.sort((a, b) => b.priority - a.priority);
 
     // Advisory claim-aware warnings (WIP Aura, H0): for each ready task, check
     // ACTIVE PathClaims held by OTHER members. Overlap = the claim pattern
     // appears in (or shares tokens with) the task text. Warnings only — the
     // task is still assigned (PathClaims are advisory per the accepted
     // contract); the warning lets owners escalate.
-    const warnable = [...ready, ...reservedReady];
+    const warnable = [...ready, ...stickyReady];
     if (opts?.activeClaims?.length) {
       for (const t of warnable) {
         // S-07: dedupe warnings per (task, holder) — a task overlapping
@@ -348,14 +419,6 @@ export class Scheduler {
       }
     }
 
-    const idle = members
-      // R3: an idle member whose currentTaskId is still set is corrupt state
-      // (recovery/crash leftover, or a member that lost its working flag). It
-      // must NOT receive a new assignment — its old task is still owned and
-      // would strand, and its currentTaskId would be silently overwritten.
-      // Only genuinely idle, unowned members are assignment candidates.
-      .filter((m) => m.status === "idle" && m.role !== "coordinator" && !m.currentTaskId && !isChatting(m, swarm))
-      .sort((a, b) => a.name.localeCompare(b.name));
     // Assign each ready task to the best-suited idle member. The coordinator's
     // intent is encoded in the task title/description and the members' roles —
     // prefer the member whose name/role best matches the task, so a task like
@@ -371,13 +434,12 @@ export class Scheduler {
     ).length;
     const capacity = Math.max(0, swarm.policies.maxConcurrentMembers - active);
 
-    const memberByName = new Map(members.map((m) => [m.name, m]));
-    const idleById = new Map(idle.map((m) => [m.id, m]));
-    // Durable intended-owner preference: reserved tasks are offered ONLY to
-    // their intended member (if eligible). An ineligible intended owner HOLDs
-    // the task within the reservation TTL — it must NOT leak to a different
-    // member while the intent is still live (the misassignment bug this fixes).
-    for (const task of reservedReady) {
+    // Durable intended-owner preference + coordinator stickiness: sticky tasks
+    // are offered ONLY to their intended member (if eligible). An ineligible
+    // intended owner HOLDs the task within the sticky window — it must NOT
+    // leak to a different member while the intent is still live (the
+    // misassignment bug this fixes).
+    for (const task of stickyReady) {
       if (result.assigned.length >= capacity) {
         result.readyUnassigned.push(task.id);
         continue;
@@ -392,9 +454,9 @@ export class Scheduler {
           result.readyUnassigned.push(task.id);
         }
       } else {
-        // Intended member not idle (busy/chatting/stopped/not found): HOLD —
-        // the reservation TTL sweep will free it if the owner never becomes
-        // eligible. Not assigned to anyone else.
+        // Intended member not idle (busy/chatting): HOLD — the sticky window
+        // sweep frees it if the owner never becomes eligible (or falls through
+        // when the owner is unavailable). Not assigned to anyone else.
         result.readyUnassigned.push(task.id);
       }
     }
@@ -439,7 +501,12 @@ export class Scheduler {
   ): Map<string, SwarmMember[]> {
     const out = new Map<string, SwarmMember[]>();
     const taskById = new Map(all.map((t) => [t.id, t]));
-    const stop = new Set(["stopped", "stopping", "failed"]);
+    // Non-resumable members (stopped/stopping/failed/interrupted — needs
+    // respawn) must NEVER receive a task by affinity. Defense-in-depth: the
+    // idle filter already excludes them, but the scoring path filters again so
+    // no future idle-filter change can leak a non-resumable member into a
+    // candidate list.
+    const stop = NON_RESUMABLE;
     for (const task of ready) {
       const full = taskById.get(task.id);
       const title = (full?.title ?? task.title ?? "").toLowerCase();
@@ -493,6 +560,14 @@ export class Scheduler {
       // ran) — it must not consume the retry budget, so maxRetries=0 semantics
       // ("fail after the first REAL failed attempt") is preserved.
       await this.store.releaseTask(task.id, { countAsRetry: false }).catch(() => undefined);
+      // Sticky-marker hygiene: a kickoff failure means THIS member could not
+      // take the task — clear any sticky/reassign marker so the next pass does
+      // NOT re-offer the task to the same member within the sticky window (a
+      // persistently broken kickoff would otherwise pin the task for 10 min).
+      // Coordinator reassign stickiness is unaffected: the reassign path
+      // kicks off its own prompt OUTSIDE assignTask and never releases on
+      // failure, so its marker survives.
+      await this.store.setTaskReservation(task.id, null).catch(() => undefined);
       await this.store.updateMemberStatus(member.id, "idle", { currentTaskId: null, lastActiveAt: Date.now() }).catch(() => undefined);
       console.error(`[swarm] scheduler kickoff failed for ${member.name}:`, (err as Error).message);
       // Stall auto-diagnosis hook: a kickoff failure may be a model usage-limit
