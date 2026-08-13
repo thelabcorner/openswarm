@@ -14,7 +14,7 @@ openswarm turns OpenCode into a coordination fabric for multiple agents. Instead
 ## Badges
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Tests: 365 passing](https://img.shields.io/badge/tests-365%20passing-brightgreen)
+![Tests: 581 passing](https://img.shields.io/badge/tests-581%20passing-brightgreen)
 ![Typecheck: clean](https://img.shields.io/badge/typecheck-clean-brightgreen)
 ![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-black)
 ![Plugin: OpenCode 1.18.x](https://img.shields.io/badge/plugin-OpenCode%201.18.x-6f42c1)
@@ -164,6 +164,25 @@ swarm_spawn(swarmId, members: [{ name: "vision-reader", role: "image reader", ca
 
 ---
 
+## Caching & cost efficiency
+
+Measured across a real multi-day swarm deployment (opencode-go provider). Figures are aggregated and relative — no raw per-session token or dollar counts:
+
+- **Swarm sessions cache-read ~2.7x better than regular sessions on a per-session basis**: median cache-hit ratio in swarm sessions is ≈ 98%, vs ≈ 92% for regular build/explore sessions (means ≈ 95% vs ≈ 87%).
+- **Distribution is one-sided**: no swarm session dropped below a 50% cache-hit rate (regular sessions had ~30 such sessions). A third of swarm sessions hit ≥ 99% cache-read ratio; only ~8% of regular sessions did.
+- **Swarm sessions produced roughly half the deployment's token volume while costing only about a third of total spend** — driven by near-total cache reads. Effective per-token cost in swarm sessions is ~2.7x cheaper than in regular sessions.
+- **Mechanism: shared session lineage.** All members re-read the same projected session history; the first member to run warms the cache and every subsequent member hits it. Sequential / complementary member ordering amplifies the effect.
+- **The low-hit-rate swarm outliers were freshly spawned members** with ~zero prior tokens — a new worker reading an unwarmed context, then going idle/dead. Negligible cost, but wasted cache warmth.
+
+### Operational guidance
+
+- **Batch member creation into fewer, longer-lived members.** Constantly respawning fresh members forfeits cache warmth.
+- **Keep members sharing the same session / projected history** when reads dominate their work.
+- **Watch cache-hit ratio as a health metric.** If it drops below ~95% at the session level, expect per-token cost to multiply (context rewrites, eviction, or fresh spawns).
+- **Cache hit correlates with cost in the expected direction:** at ~99% hit, sessions remain cheap despite huge token volume.
+
+---
+
 ## Tools reference
 
 | Tool | What it does |
@@ -239,7 +258,7 @@ The suite covers unit tests, storage/migration, messaging reliability, scheduler
 
 ```sh
 bun run typecheck   # tsc --noEmit
-bun test            # 365 tests, 1112 assertions
+bun test            # 581 tests, 2073 assertions
 bun run build       # bundle the plugin to dist/
 bun run e2e         # fresh-server plugin load check
 ```
